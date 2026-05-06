@@ -1259,6 +1259,7 @@ class StreakerDetectApp:
         self._player_composite = None
         self._player_idx       = 0
         self._player_paused    = True
+        self._canvas_mode      = 'detect'  # 'detect' | 'player'
         self._player_speed_ms  = 80
         self._player_show_comp = False
         self._player_loop_id   = None
@@ -1802,8 +1803,8 @@ class StreakerDetectApp:
             self.root.after(250, self._poll_queues)
 
     def _update_preview(self, frame_bgr, stats):
-        if self._player_frames and not self._player_paused:
-            return  # player is actively playing; don't clobber it
+        if self._canvas_mode == 'player':
+            return  # player owns the canvas
         cw = self.preview_canvas.winfo_width()
         ch = self.preview_canvas.winfo_height()
         if cw < 2 or ch < 2:
@@ -2287,6 +2288,7 @@ class StreakerDetectApp:
 
     def _player_toggle_play(self):
         self._player_paused = not self._player_paused
+        self._canvas_mode = 'player' if not self._player_paused else 'detect'
         self._player_play_btn.config(text='⏸ Pause' if not self._player_paused else '▶ Play')
         if not self._player_paused:
             self._player_play_loop()
@@ -2304,6 +2306,7 @@ class StreakerDetectApp:
             self.root.after_cancel(self._player_loop_id)
             self._player_loop_id = None
         self._player_paused = True
+        self._canvas_mode = 'detect'
         if hasattr(self, '_player_play_btn'):
             self._player_play_btn.config(text='▶ Play')
 
