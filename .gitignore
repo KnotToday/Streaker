@@ -1,57 +1,18 @@
-# Python
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
+# Only track Streaker Detect/ — everything else is excluded
 
-# PyInstaller
-build/
-dist/
-*.pkg
+# Ignore all root-level files and folders by default
+/*
+!/.gitignore
+!/Streaker Detect/
 
-# Logs
-*.log
-*.txt.bak
-ffmpeg_log.txt
-lint_report.txt
-
-# Generated output (large binary folders)
-event_*/
-clips_*/
-Frame_*/
-synth_test_results/
-compare_results/
-
-# Video and image files (too large for git)
-*.mkv
-*.mp4
-*.avi
-*.jpg
-*.jpeg
-*.png
-*.gif
-*.bmp
-*.tiff
-
-# Archives
-*.zip
-
-# Claude Code internal settings
-.claude/
-
-# Local config with personal coords/RTSP URL — set per machine, not tracked
-stream_capture_config.json
-
-# Sibling projects (each will get their own repo eventually)
-Dahua_Display/
-TLE_SORT/
-Sat_Calcs/
-Get_TLE/
-archive/
-
-# VS Code
-.vscode/
-
-# OS
-Thumbs.db
-desktop.ini
+# Streaker Detect — exclude build artifacts and generated output
+/Streaker Detect/build/
+/Streaker Detect/dist/
+/Streaker Detect/__pycache__/
+/Streaker Detect/*.pyc
+/Streaker Detect/synth_test_results/
+/Streaker Detect/compare_results/
+/Streaker Detect/event_*/
+/Streaker Detect/clips_*/
+/Streaker Detect/*.log
+/Streaker Detect/streaker_config.json

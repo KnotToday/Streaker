@@ -1,4 +1,0 @@
-pyinstaller --noconfirm --onefile --windowed ^
-  --icon=display.ico ^
-  --name "DahuaCam" ^
-  dahua_display.py
