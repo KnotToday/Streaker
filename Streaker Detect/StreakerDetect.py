@@ -48,6 +48,9 @@ DEFAULT_WARMUP_FRAMES      = 200
 DEFAULT_CLOUD_THRESH       = 80
 DEFAULT_CLOUD_RATIO        = 0.15
 
+VERSION      = "1.0.0"
+GITHUB_REPO  = "KnotToday/Streaker"
+
 THUMB_W  = 320
 THUMB_H  = 200   # image portion height
 INFO_H   = 38    # params strip below image (3 lines × ~11 px + padding)
@@ -1268,6 +1271,8 @@ class StreakerDetectApp:
         self._load_config()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._poll_queues()
+        if getattr(sys, 'frozen', False):
+            self.root.after(4000, self._check_for_update)
 
     # --------------------------------------------------------------------------
     # Config persistence
@@ -1458,6 +1463,12 @@ class StreakerDetectApp:
         tk.Label(btn_f2, textvariable=self.stats_var, bg=BG,
                  fg='#aaffaa', font=('Courier', 14),
                  justify='left').pack(side='left', padx=8)
+
+        self._update_btn = tk.Button(btn_f2, text=f"v{VERSION}",
+                                     bg=BG, fg='#444444',
+                                     font=('Arial', 8), relief='flat',
+                                     padx=4, state='disabled')
+        self._update_btn.pack(side='right', padx=6)
 
         # ── Row 2: detection & tracking sliders ───────────────────────────
         row2 = tk.Frame(self.root, bg=BG)
@@ -2047,6 +2058,62 @@ class StreakerDetectApp:
         if outdir:
             cmd += ['--preoutput', outdir]
         subprocess.Popen(cmd)
+
+    def _check_for_update(self):
+        import urllib.request
+        def _worker():
+            try:
+                url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+                req = urllib.request.Request(url, headers={'User-Agent': 'StreakerDetect'})
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    data = json.loads(resp.read())
+                tag = data.get('tag_name', '').lstrip('v')
+                if not tag or tag == VERSION:
+                    return
+                assets = data.get('assets', [])
+                exe_url = next((a['browser_download_url'] for a in assets
+                                if a['name'].lower().endswith('.exe')), None)
+                if exe_url:
+                    self.root.after(0, lambda: self._update_btn.config(
+                        text=f"⬆ Update v{tag}", fg='#ffaa00', bg='#2a1a00',
+                        state='normal',
+                        command=lambda: self._do_update(exe_url, tag)))
+            except Exception:
+                pass
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _do_update(self, download_url, new_version):
+        import urllib.request
+        if not messagebox.askyesno("Update Available",
+                f"Download and install v{new_version}?\n\nThe app will restart automatically."):
+            return
+        self._update_btn.config(text="Downloading…", state='disabled', fg='#888888', bg=BG)
+
+        exe_path = sys.executable
+
+        def _download():
+            try:
+                tmp_path = exe_path + '.new'
+                urllib.request.urlretrieve(download_url, tmp_path)
+                bat = (
+                    f'@echo off\r\n'
+                    f'timeout /t 2 /nobreak >nul\r\n'
+                    f'move /Y "{tmp_path}" "{exe_path}"\r\n'
+                    f'start "" "{exe_path}"\r\n'
+                )
+                bat_path = exe_path + '_update.bat'
+                with open(bat_path, 'w') as f:
+                    f.write(bat)
+                subprocess.Popen(['cmd', '/c', bat_path],
+                                 creationflags=subprocess.CREATE_NO_WINDOW)
+                self.root.after(0, self.root.quit)
+            except Exception as e:
+                self.root.after(0, lambda: (
+                    messagebox.showerror("Update Failed", str(e)),
+                    self._update_btn.config(text=f"⬆ Update v{new_version}",
+                                            state='normal', fg='#ffaa00', bg='#2a1a00')
+                ))
+        threading.Thread(target=_download, daemon=True).start()
 
     def _launch_compare(self):
         compare_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'StreakerCompare.py')
