@@ -1,0 +1,22 @@
+{
+  "mask_path": "",
+  "output_dir": "T:/Dahua_MKV_Streaker/08-12-2025",
+  "threshold": 40,
+  "min_area": 120,
+  "max_area": 1400,
+  "min_aspect": 1.0,
+  "max_track": 5,
+  "pre_buffer": 15,
+  "post_buffer": 30,
+  "warmup": 200,
+  "cloud_thresh": 50,
+  "cloud_ratio": 0.08,
+  "scale": 0.5,
+  "stitch_gap": 90,
+  "stitch_tol": 80,
+  "min_move": 0,
+  "min_travel": 15,
+  "min_bright": 180,
+  "cloud_min_bright": 0,
+  "cloud_min_travel": 0
+}
