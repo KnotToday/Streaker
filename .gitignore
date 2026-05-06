@@ -42,6 +42,13 @@ compare_results/
 # Local config with personal coords/RTSP URL — set per machine, not tracked
 stream_capture_config.json
 
+# Sibling projects (each will get their own repo eventually)
+Dahua_Display/
+TLE_SORT/
+Sat_Calcs/
+Get_TLE/
+archive/
+
 # VS Code
 .vscode/
 
