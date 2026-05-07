@@ -593,6 +593,15 @@ class DetectionWorker:
             if max_peak < cloud_min_bright:
                 return False  # skip — too dim for cloudy conditions
 
+        last_det_pos = max(
+            (i for i, (_, _, _, fbboxes, _) in enumerate(pending) if fbboxes),
+            default=-1)
+        if last_det_pos >= 0:
+            trim_end = last_det_pos + 11  # keep 10 frames after last detection
+            if trim_end < len(pending):
+                pending     = pending[:trim_end]
+                gray_frames = gray_frames[:trim_end]
+
         src = os.path.splitext(os.path.basename(self.input_path))[0]
         first_frame = pending[0][0] if pending else 0
         fps = self.params.get('fps', 20)
@@ -1255,16 +1264,17 @@ class StreakerDetectApp:
         self.worker_thread = None
 
         # Embedded player state
-        self._player_frames    = []
-        self._player_composite = None
-        self._player_idx       = 0
-        self._player_paused    = True
-        self._canvas_mode      = 'detect'  # 'detect' | 'player'
-        self._player_speed_ms  = 80
-        self._player_show_comp = False
-        self._player_loop_id   = None
-        self._player_event_dir = None
-        self._player_scrubbing = False
+        self._player_frames      = []
+        self._player_frame_cache = []   # pre-loaded RGB arrays indexed by frame position
+        self._player_composite   = None
+        self._player_idx         = 0
+        self._player_paused      = True
+        self._canvas_mode        = 'detect'  # 'detect' | 'player'
+        self._player_speed_ms    = 80
+        self._player_show_comp   = False
+        self._player_loop_id     = None
+        self._player_event_dir   = None
+        self._player_scrubbing   = False
         self._player_fps       = 20.0
         self._player_tester_clip = None
 
@@ -1398,6 +1408,28 @@ class StreakerDetectApp:
                   relief='flat', width=2).pack(side='left', padx=(1, 0))
         tk.Button(inp_r, text="📁", command=self._browse_input_folder, bg='#444444', fg='white',
                   relief='flat', width=2).pack(side='left', padx=(1, 0))
+        self.input_path.trace_add('write', lambda *_: self.root.after(200, self._queue_populate_from_var))
+
+        # MKV queue panel
+        self._queue_count_lbl = tk.Label(inp_f, text="", bg=BG, fg='#888888',
+                                         font=('Arial', 7))
+        self._queue_count_lbl.pack(anchor='w')
+        q_inner = tk.Frame(inp_f, bg=BG)
+        q_inner.pack(fill='x')
+        self._queue_listbox = tk.Listbox(q_inner, height=4, selectmode='extended',
+                                         bg='#0d1b2a', fg='white',
+                                         selectbackground='#1a3a5a',
+                                         font=('Consolas', 8), relief='flat',
+                                         highlightthickness=1,
+                                         highlightbackground='#1a3a5a')
+        q_sb = tk.Scrollbar(q_inner, orient='vertical', command=self._queue_listbox.yview)
+        self._queue_listbox.config(yscrollcommand=q_sb.set)
+        self._queue_listbox.pack(side='left', fill='x', expand=True)
+        q_sb.pack(side='left', fill='y')
+        tk.Button(q_inner, text="✕ Remove", command=self._queue_remove_selected,
+                  bg='#2a1a1a', fg='#ff6666',
+                  font=('Arial', 8), relief='flat', padx=6).pack(side='left', padx=(4, 0))
+
         file_input(row1, "Mask (optional)",        self.mask_path,  self._browse_mask)
         file_input(row1, "Output folder",          self.output_dir, self._browse_output)
         sep(row1)
@@ -1634,6 +1666,28 @@ class StreakerDetectApp:
             auto_mask = os.path.join(path, "mask.png")
             if os.path.exists(auto_mask):
                 self.mask_path.set(auto_mask)
+            self._queue_populate(path)
+
+    def _queue_populate_from_var(self):
+        self._queue_populate(self.input_path.get().strip())
+
+    def _queue_populate(self, folder):
+        self._queue_listbox.delete(0, 'end')
+        if not os.path.isdir(folder):
+            self._queue_count_lbl.config(text="")
+            return
+        clips = sorted(f for f in os.listdir(folder) if f.lower().endswith('.mkv'))
+        for c in clips:
+            self._queue_listbox.insert('end', c)
+        n = len(clips)
+        self._queue_count_lbl.config(text=f"{n} MKV{'s' if n != 1 else ''} queued")
+
+    def _queue_remove_selected(self):
+        for i in reversed(self._queue_listbox.curselection()):
+            self._queue_listbox.delete(i)
+        n = self._queue_listbox.size()
+        self._queue_count_lbl.config(
+            text=f"{n} MKV{'s' if n != 1 else ''} queued" if n else "")
 
     def _browse_mask(self):
         path = filedialog.askopenfilename(
@@ -1701,9 +1755,13 @@ class StreakerDetectApp:
 
         # Collect MKVs
         if os.path.isdir(inp):
-            clips = sorted([
-                os.path.join(inp, f) for f in os.listdir(inp)
-                if f.lower().endswith('.mkv')])
+            if self._queue_listbox.size() > 0:
+                clips = [os.path.join(inp, self._queue_listbox.get(i))
+                         for i in range(self._queue_listbox.size())]
+            else:
+                clips = sorted([
+                    os.path.join(inp, f) for f in os.listdir(inp)
+                    if f.lower().endswith('.mkv')])
             if force:
                 pending = clips
                 skipped = 0
@@ -2190,11 +2248,29 @@ class StreakerDetectApp:
 
         self._player_stop_loop()
         self._player_frames      = frame_paths
+        self._player_frame_cache = [None] * len(frame_paths)
         self._player_event_dir   = event_dir
         self._player_idx         = 0
         self._player_paused      = True
         self._player_show_comp   = False
         self._player_composite   = None
+
+        def _preload_frames(paths, target_dir):
+            cw = self.preview_canvas.winfo_width()  or 640
+            ch = self.preview_canvas.winfo_height() or 480
+            for i, p in enumerate(paths):
+                if self._player_event_dir != target_dir:
+                    return
+                img = cv2.imread(p, cv2.IMREAD_COLOR)
+                if img is None:
+                    continue
+                h, w = img.shape[:2]
+                scale = min(cw / w, ch / h)
+                nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
+                resized = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA)
+                self._player_frame_cache[i] = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+
+        threading.Thread(target=_preload_frames, args=(frame_paths, event_dir), daemon=True).start()
         self._player_tester_clip = None
         self._player_blend_btn.config(bg='#252525')
         self._player_tester_btn.config(text='✂ Cutting…', state='disabled', bg='#2a2a2a')
@@ -2249,19 +2325,34 @@ class StreakerDetectApp:
     def _player_show_frame(self):
         if self._player_show_comp and self._player_composite is not None:
             img_bgr = self._player_composite
+            cw = self.preview_canvas.winfo_width()  or 640
+            ch = self.preview_canvas.winfo_height() or 480
+            h, w = img_bgr.shape[:2]
+            scale = min(cw / w, ch / h)
+            nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
+            resized = cv2.resize(img_bgr, (nw, nh), interpolation=cv2.INTER_AREA)
+            rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
         elif self._player_frames:
-            img_bgr = cv2.imread(self._player_frames[self._player_idx], cv2.IMREAD_COLOR)
-            if img_bgr is None:
-                return
+            cached = (self._player_frame_cache[self._player_idx]
+                      if self._player_idx < len(self._player_frame_cache) else None)
+            if cached is not None:
+                rgb = cached
+                cw = self.preview_canvas.winfo_width()  or 640
+                ch = self.preview_canvas.winfo_height() or 480
+            else:
+                img_bgr = cv2.imread(self._player_frames[self._player_idx], cv2.IMREAD_COLOR)
+                if img_bgr is None:
+                    return
+                cw = self.preview_canvas.winfo_width()  or 640
+                ch = self.preview_canvas.winfo_height() or 480
+                h, w = img_bgr.shape[:2]
+                scale = min(cw / w, ch / h)
+                nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
+                resized = cv2.resize(img_bgr, (nw, nh), interpolation=cv2.INTER_AREA)
+                rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
         else:
             return
-        cw = self.preview_canvas.winfo_width()  or 640
-        ch = self.preview_canvas.winfo_height() or 480
-        h, w = img_bgr.shape[:2]
-        scale = min(cw / w, ch / h)
-        nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
-        resized = cv2.resize(img_bgr, (nw, nh), interpolation=cv2.INTER_AREA)
-        img = ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)))
+        img = ImageTk.PhotoImage(Image.fromarray(rgb))
         self.preview_canvas.delete('all')
         self.preview_canvas.create_image(cw // 2, ch // 2, anchor='center', image=img)
         self.preview_canvas.image = img
