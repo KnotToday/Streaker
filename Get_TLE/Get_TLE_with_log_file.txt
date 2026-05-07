@@ -1,0 +1,5 @@
+Sat 04/18/2026 16:33:49.75: Starting script execution 
+Network connection is active. 
+INFO:Get_TLE:Script started
+INFO:WDM:====== WebDriver manager ======
+^C

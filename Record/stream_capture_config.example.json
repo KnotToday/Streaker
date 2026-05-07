@@ -1,0 +1,7 @@
+{
+  "latitude": 0.0,
+  "longitude": 0.0,
+  "stop_time_offset": -11,
+  "start_time_offset": 0,
+  "rtsp_url": "rtsp://user:password@192.168.x.x:554/cam/realmonitor?channel=1&subtype=0"
+}

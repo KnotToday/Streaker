@@ -1,9 +1,10 @@
-# Only track Streaker Detect/ — everything else is excluded
-
-# Ignore all root-level files and folders by default
+# Whitelist only the folders we want to track
 /*
 !/.gitignore
 !/Streaker Detect/
+!/Get_TLE/
+!/Record/
+!/Sat_Calcs/
 
 # Streaker Detect — exclude build artifacts and generated output
 /Streaker Detect/build/
@@ -16,3 +17,20 @@
 /Streaker Detect/clips_*/
 /Streaker Detect/*.log
 /Streaker Detect/streaker_config.json
+
+# Get_TLE — exclude credentials, downloaded TLE data, and logs
+/Get_TLE/tle_config.json
+/Get_TLE/TLEz/
+/Get_TLE/*.log
+
+# Record — exclude credentials and build artifacts
+/Record/stream_capture_config.json
+/Record/build/
+/Record/dist/
+/Record/python/
+/Record/__pycache__/
+/Record/*.pyc
+
+# Sat_Calcs — exclude cache
+/Sat_Calcs/__pycache__/
+/Sat_Calcs/*.pyc
