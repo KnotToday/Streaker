@@ -1274,6 +1274,8 @@ class StreakerDetectApp:
         self._player_show_comp   = False
         self._player_loop_id     = None
         self._player_event_dir   = None
+        self._play_clock_start   = 0.0
+        self._play_clock_frame   = 0
         self._player_scrubbing   = False
         self._player_fps       = 20.0
         self._player_tester_clip = None
@@ -1379,7 +1381,7 @@ class StreakerDetectApp:
         def slider(parent, label, var, lo, hi, res):
             f = tk.Frame(parent, bg=BG)
             f.pack(side='left', padx=3, pady=2)
-            tk.Label(f, text=label, bg=BG, fg='#888888',
+            tk.Label(f, text=label, bg=BG, fg='white',
                      font=('Arial', 7)).pack(anchor='w')
             tk.Scale(f, from_=lo, to=hi, resolution=res, variable=var,
                      orient='horizontal', bg=BG, fg='white',
@@ -1387,16 +1389,30 @@ class StreakerDetectApp:
                      length=150, showvalue=True,
                      font=('Arial', 7)).pack()
 
-        # ── Row 1: title + file inputs + buttons + stats ──────────────────
-        row1 = tk.Frame(self.root, bg=BG)
-        row1.pack(fill='x', side='top')
+        # ── Outer split: left controls+canvas | right thumbnails ──────────
+        outer = tk.Frame(self.root, bg=BG)
+        outer.pack(fill='both', expand=True)
 
-        tk.Label(row1, text="STREAKER DETECT", bg=BG, fg='white',
+        # Thumbnails — packed first so it claims full height on the right
+        thumb_col = tk.Frame(outer, bg='#1a1a1a', width=360)
+        thumb_col.pack(side='right', fill='y', padx=(2, 4), pady=0)
+        thumb_col.pack_propagate(False)
+        self.thumb_panel = ThumbnailPanel(thumb_col, self._open_event_viewer)
+
+        # Left section — rows + canvas
+        left_section = tk.Frame(outer, bg=BG)
+        left_section.pack(side='left', fill='both', expand=True)
+
+        # ── Row 1 sub-row A: title | input + output | run/stop/stitch/open ─
+        r1a = tk.Frame(left_section, bg=BG)
+        r1a.pack(fill='x', side='top')
+
+        tk.Label(r1a, text="STREAKER DETECT", bg=BG, fg='white',
                  font=('Arial', 11, 'bold')).pack(side='left', padx=10, pady=4)
-        sep(row1)
+        sep(r1a)
 
-        # Input with separate file and folder browse buttons
-        inp_f = tk.Frame(row1, bg=BG)
+        # Input path
+        inp_f = tk.Frame(r1a, bg=BG)
         inp_f.pack(side='left', padx=3, pady=3)
         tk.Label(inp_f, text="Input (MKV or folder)", bg=BG, fg='#888888',
                  font=('Arial', 7)).pack(anchor='w')
@@ -1410,36 +1426,14 @@ class StreakerDetectApp:
                   relief='flat', width=2).pack(side='left', padx=(1, 0))
         self.input_path.trace_add('write', lambda *_: self.root.after(200, self._queue_populate_from_var))
 
-        # MKV queue panel
-        self._queue_count_lbl = tk.Label(inp_f, text="", bg=BG, fg='#888888',
-                                         font=('Arial', 7))
-        self._queue_count_lbl.pack(anchor='w')
-        q_inner = tk.Frame(inp_f, bg=BG)
-        q_inner.pack(fill='x')
-        self._queue_listbox = tk.Listbox(q_inner, height=4, selectmode='extended',
-                                         bg='#0d1b2a', fg='white',
-                                         selectbackground='#1a3a5a',
-                                         font=('Consolas', 8), relief='flat',
-                                         highlightthickness=1,
-                                         highlightbackground='#1a3a5a')
-        q_sb = tk.Scrollbar(q_inner, orient='vertical', command=self._queue_listbox.yview)
-        self._queue_listbox.config(yscrollcommand=q_sb.set)
-        self._queue_listbox.pack(side='left', fill='x', expand=True)
-        q_sb.pack(side='left', fill='y')
-        tk.Button(q_inner, text="✕ Remove", command=self._queue_remove_selected,
-                  bg='#2a1a1a', fg='#ff6666',
-                  font=('Arial', 8), relief='flat', padx=6).pack(side='left', padx=(4, 0))
+        file_input(r1a, "Output folder", self.output_dir, self._browse_output)
+        sep(r1a)
 
-        file_input(row1, "Mask (optional)",        self.mask_path,  self._browse_mask)
-        file_input(row1, "Output folder",          self.output_dir, self._browse_output)
-        sep(row1)
-
-        # Right column: two stacked button rows, aligned together
-        right_col = tk.Frame(row1, bg=BG)
-        right_col.pack(side='left', padx=4, pady=2)
-
-        btn_f = tk.Frame(right_col, bg=BG)
-        btn_f.pack(side='top', anchor='w', pady=(2, 0))
+        btn_f = tk.Frame(r1a, bg=BG)
+        btn_f.pack(side='left', padx=4, pady=2)
+        tk.Checkbutton(btn_f, text="Force Re-run", variable=self.p_force_rerun,
+                       bg=BG, fg='#aaaaaa', selectcolor='#333333',
+                       font=('Arial', 8), activebackground=BG).pack(side='left', padx=(2, 6))
         self.run_btn = tk.Button(btn_f, text="▶ RUN",
                                  command=self._start_detection,
                                  bg='#006600', fg='white',
@@ -1464,11 +1458,40 @@ class StreakerDetectApp:
                   font=('Arial', 9, 'bold'),
                   relief='flat', padx=10, pady=3).pack(side='left', padx=2)
 
-        btn_f2 = tk.Frame(right_col, bg=BG)
-        btn_f2.pack(side='top', anchor='w', pady=(0, 2))
-        tk.Checkbutton(btn_f2, text="Force Re-run", variable=self.p_force_rerun,
-                       bg=BG, fg='#aaaaaa', selectcolor='#333333',
-                       font=('Arial', 8), activebackground=BG).pack(side='left', padx=(2, 6))
+        # ── Row 1 sub-row B: queue/mask | force re-run/logs/player/synth/compare ─
+        r1b = tk.Frame(left_section, bg=BG)
+        r1b.pack(fill='x', side='top')
+
+        # MKV queue panel
+        q_frame = tk.Frame(r1b, bg=BG)
+        q_frame.pack(side='left', padx=3, pady=(0, 3))
+        self._queue_count_lbl = tk.Label(q_frame, text="", bg=BG, fg='#888888',
+                                         font=('Arial', 7))
+        self._queue_count_lbl.pack(anchor='w')
+        q_inner = tk.Frame(q_frame, bg=BG)
+        q_inner.pack(fill='x')
+        self._queue_listbox = tk.Listbox(q_inner, height=2, width=55, selectmode='extended',
+                                         bg='#0d1b2a', fg='white',
+                                         selectbackground='#1a3a5a',
+                                         font=('Consolas', 8), relief='flat',
+                                         highlightthickness=1,
+                                         highlightbackground='#1a3a5a')
+        q_sb = tk.Scrollbar(q_inner, orient='vertical', command=self._queue_listbox.yview)
+        self._queue_listbox.config(yscrollcommand=q_sb.set)
+        self._queue_listbox.pack(side='left', fill='x', expand=True)
+        q_sb.pack(side='left', fill='y')
+        tk.Button(q_inner, text="✕ Remove", command=self._queue_remove_selected,
+                  bg='#2a1a1a', fg='#ff6666',
+                  font=('Arial', 8), relief='flat', padx=6).pack(side='left', padx=(4, 0))
+        tk.Button(q_inner, text="+ Add", command=self._queue_add_files,
+                  bg='#1a2a1a', fg='#66ff66',
+                  font=('Arial', 8), relief='flat', padx=6).pack(side='left', padx=(2, 0))
+
+        file_input(r1b, "Mask (optional)", self.mask_path, self._browse_mask)
+        sep(r1b)
+
+        btn_f2 = tk.Frame(r1b, bg=BG)
+        btn_f2.pack(side='left', padx=4, pady=2)
         tk.Button(btn_f2, text="📋 VIEW LOGS",
                   command=self._show_logs_popup,
                   bg='#443300', fg='white',
@@ -1497,14 +1520,14 @@ class StreakerDetectApp:
                  fg='#aaffaa', font=('Courier', 14),
                  justify='left').pack(side='left', padx=8)
 
-        self._update_btn = tk.Button(btn_f2, text=f"v{VERSION}",
-                                     bg=BG, fg='#444444',
-                                     font=('Arial', 8), relief='flat',
-                                     padx=4, state='disabled')
-        self._update_btn.pack(side='right', padx=6)
+        self._update_btn = tk.Button(btn_f2, text="",
+                                     bg=BG, fg='#ffaa00',
+                                     font=('Arial', 8, 'bold'), relief='flat',
+                                     padx=6)
+        # not packed — only shown when an update is available
 
         # ── Row 2: detection & tracking sliders ───────────────────────────
-        row2 = tk.Frame(self.root, bg=BG)
+        row2 = tk.Frame(left_section, bg=BG)
         row2.pack(fill='x', side='top')
 
         for args in [
@@ -1520,7 +1543,7 @@ class StreakerDetectApp:
             slider(row2, *args)
 
         # ── Row 3: cloud, filter & stitch sliders ─────────────────────────
-        row3 = tk.Frame(self.root, bg=BG)
+        row3 = tk.Frame(left_section, bg=BG)
         row3.pack(fill='x', side='top')
 
         for args in [
@@ -1537,7 +1560,7 @@ class StreakerDetectApp:
         # Scale dropdown (row 3)
         sf = tk.Frame(row3, bg=BG)
         sf.pack(side='left', padx=8, pady=2)
-        tk.Label(sf, text="Detect Scale", bg=BG, fg='#888888',
+        tk.Label(sf, text="Detect Scale", bg=BG, fg='white',
                  font=('Arial', 7)).pack(anchor='w')
         scale_menu = ttk.Combobox(sf, textvariable=self.p_scale,
                                   values=[1.0, 0.75, 0.5, 0.25],
@@ -1545,12 +1568,12 @@ class StreakerDetectApp:
         scale_menu.pack()
 
         # ── Row 4: adaptive cloud overrides ───────────────────────────────
-        row4 = tk.Frame(self.root, bg=BG)
+        row4 = tk.Frame(left_section, bg=BG)
         row4.pack(fill='x', side='top')
         tk.Label(row4, text="ADAPTIVE CLOUD:", bg=BG, fg='#5599bb',
                  font=('Arial', 7, 'bold')).pack(side='left', padx=(8, 4), pady=2)
         tk.Label(row4, text="When ≥30% of recent frames are cloudy, override these filters:",
-                 bg=BG, fg='#555555', font=('Arial', 7)).pack(side='left', padx=(0, 8))
+                 bg=BG, fg='#888888', font=('Arial', 7)).pack(side='left', padx=(0, 8))
         for args in [
             ("Cloud Min Bright", self.p_cloud_min_bright, 0, 255, 5),
             ("Cloud Min Travel", self.p_cloud_min_travel, 0, 100, 5),
@@ -1558,7 +1581,7 @@ class StreakerDetectApp:
             slider(row4, *args)
 
         # ── Progress bar ───────────────────────────────────────────────────
-        prog = tk.Frame(self.root, bg='#0a0a0a', pady=1)
+        prog = tk.Frame(left_section, bg='#0a0a0a', pady=1)
         prog.pack(fill='x', side='top')
         self.progress_var = tk.DoubleVar(value=0)
         ttk.Progressbar(prog, variable=self.progress_var,
@@ -1567,8 +1590,8 @@ class StreakerDetectApp:
         tk.Label(prog, textvariable=self.progress_lbl, bg='#0a0a0a',
                  fg='#aaaaaa', font=('Arial', 8)).pack()
 
-        # ── Main area: preview + thumbnails ───────────────────────────────
-        main = tk.Frame(self.root, bg='#1a1a1a')
+        # ── Main area: preview canvas ──────────────────────────────────────
+        main = tk.Frame(left_section, bg='#1a1a1a')
         main.pack(fill='both', expand=True)
 
         left_pane = tk.Frame(main, bg='#1a1a1a')
@@ -1599,8 +1622,8 @@ class StreakerDetectApp:
         ctrl_bar.pack(fill='x', pady=2)
         tk.Button(ctrl_bar, text='|◀', command=lambda: self._player_goto(0),
                   bg='#252525', fg='white', relief='flat', padx=4).pack(side='left', padx=2)
-        tk.Button(ctrl_bar, text='◀',  command=lambda: self._player_step(-1),
-                  bg='#252525', fg='white', relief='flat', padx=4).pack(side='left', padx=2)
+        #tk.Button(ctrl_bar, text='◀',  command=lambda: self._player_step(-1),
+                  #bg='#252525', fg='white', relief='flat', padx=4).pack(side='left', padx=2)
         self._player_play_btn = tk.Button(ctrl_bar, text='▶ Play',
                                           command=self._player_toggle_play,
                                           bg='#1a4a1a', fg='white', relief='flat', padx=8)
@@ -1608,12 +1631,13 @@ class StreakerDetectApp:
         tk.Button(ctrl_bar, text='▶|', command=lambda: self._player_goto(-1),
                   bg='#252525', fg='white', relief='flat', padx=4).pack(side='left', padx=2)
         tk.Label(ctrl_bar, text='Speed:', **lp).pack(side='left', padx=(10, 2))
-        self._player_speed_var = tk.IntVar(value=80)
-        tk.Scale(ctrl_bar, from_=10, to=500, orient='horizontal',
-                 variable=self._player_speed_var, length=90, showvalue=False,
-                 bg=BP, fg='#666', troughcolor='#2a2a2a', highlightthickness=0,
-                 command=lambda v: setattr(self, '_player_speed_ms', int(v))
-                 ).pack(side='left')
+        self._player_speed_var = tk.StringVar(value='80ms')
+        tk.Button(ctrl_bar, text='−', command=self._player_speed_slower,
+                  bg='#252525', fg='white', relief='flat', padx=6).pack(side='left')
+        tk.Label(ctrl_bar, textvariable=self._player_speed_var,
+                 bg=BP, fg='white', font=('Consolas', 8), width=6).pack(side='left')
+        tk.Button(ctrl_bar, text='+', command=self._player_speed_faster,
+                  bg='#252525', fg='white', relief='flat', padx=6).pack(side='left')
         tk.Button(ctrl_bar, text='Real Time', command=self._player_set_realtime,
                   bg='#252525', fg='#cccccc', relief='flat', padx=4).pack(side='left', padx=3)
         self._player_blend_btn = tk.Button(ctrl_bar, text='Max-Blend',
@@ -1637,10 +1661,6 @@ class StreakerDetectApp:
         self.root.bind('<Right>', lambda e: self._player_step(1)  if self._player_event_dir else None)
         self.root.bind('<space>', lambda e: self._player_toggle_play() if self._player_event_dir else None)
 
-        right = tk.Frame(main, bg='#1a1a1a', width=360)
-        right.pack(side='right', fill='y', padx=(2, 4), pady=4)
-        right.pack_propagate(False)
-        self.thumb_panel = ThumbnailPanel(right, self._open_event_viewer)
 
     # --------------------------------------------------------------------------
     # File Browsers
@@ -1688,6 +1708,20 @@ class StreakerDetectApp:
         n = self._queue_listbox.size()
         self._queue_count_lbl.config(
             text=f"{n} MKV{'s' if n != 1 else ''} queued" if n else "")
+
+    def _queue_add_files(self):
+        paths = filedialog.askopenfilenames(
+            title="Add MKV files to queue",
+            filetypes=[("MKV files", "*.mkv")])
+        if not paths:
+            return
+        existing = set(self._queue_listbox.get(0, 'end'))
+        for p in paths:
+            if p not in existing:
+                self._queue_listbox.insert('end', p)
+                existing.add(p)
+        n = self._queue_listbox.size()
+        self._queue_count_lbl.config(text=f"{n} MKV{'s' if n != 1 else ''} queued")
 
     def _browse_mask(self):
         path = filedialog.askopenfilename(
@@ -1756,8 +1790,11 @@ class StreakerDetectApp:
         # Collect MKVs
         if os.path.isdir(inp):
             if self._queue_listbox.size() > 0:
-                clips = [os.path.join(inp, self._queue_listbox.get(i))
-                         for i in range(self._queue_listbox.size())]
+                clips = [
+                    e if os.path.isabs(e) else os.path.join(inp, e)
+                    for e in (self._queue_listbox.get(i)
+                              for i in range(self._queue_listbox.size()))
+                ]
             else:
                 clips = sorted([
                     os.path.join(inp, f) for f in os.listdir(inp)
@@ -2133,10 +2170,13 @@ class StreakerDetectApp:
                 exe_url = next((a['browser_download_url'] for a in assets
                                 if a['name'].lower().endswith('.exe')), None)
                 if exe_url:
-                    self.root.after(0, lambda: self._update_btn.config(
-                        text=f"⬆ Update v{tag}", fg='#ffaa00', bg='#2a1a00',
-                        state='normal',
-                        command=lambda: self._do_update(exe_url, tag)))
+                    def _show_update(u=exe_url, t=tag):
+                        self.root.title(f"StreakerDetect  v{VERSION}  ⬆ v{t} available")
+                        self._update_btn.config(
+                            text=f"⬆ Update v{t}", bg='#2a1a00',
+                            command=lambda: self._do_update(u, t))
+                        self._update_btn.pack(side='right', padx=6)
+                    self.root.after(0, _show_update)
             except Exception:
                 pass
         threading.Thread(target=_worker, daemon=True).start()
@@ -2146,7 +2186,7 @@ class StreakerDetectApp:
         if not messagebox.askyesno("Update Available",
                 f"Download and install v{new_version}?\n\nThe app will restart automatically."):
             return
-        self._update_btn.config(text="Downloading…", state='disabled', fg='#888888', bg=BG)
+        self._update_btn.config(text="Downloading…", fg='#888888', bg=BG)
 
         exe_path = sys.executable
 
@@ -2170,7 +2210,7 @@ class StreakerDetectApp:
                 self.root.after(0, lambda: (
                     messagebox.showerror("Update Failed", str(e)),
                     self._update_btn.config(text=f"⬆ Update v{new_version}",
-                                            state='normal', fg='#ffaa00', bg='#2a1a00')
+                                            fg='#ffaa00', bg='#2a1a00')
                 ))
         threading.Thread(target=_download, daemon=True).start()
 
@@ -2382,6 +2422,9 @@ class StreakerDetectApp:
         self._canvas_mode = 'player' if not self._player_paused else 'detect'
         self._player_play_btn.config(text='⏸ Pause' if not self._player_paused else '▶ Play')
         if not self._player_paused:
+            # Anchor the clock to now so the loop can compensate for render overhead
+            self._play_clock_start = time.perf_counter()
+            self._play_clock_frame = self._player_idx
             self._player_play_loop()
 
     def _player_play_loop(self):
@@ -2389,8 +2432,14 @@ class StreakerDetectApp:
             return
         if self._player_idx >= len(self._player_frames) - 1:
             self._player_idx = 0
+            self._play_clock_start = time.perf_counter()
+            self._play_clock_frame = 0
         self._player_step(1)
-        self._player_loop_id = self.root.after(self._player_speed_ms, self._player_play_loop)
+        # Calculate exact time the next frame should fire based on wall clock
+        frames_played = self._player_idx - self._play_clock_frame
+        ideal_next = self._play_clock_start + (frames_played + 1) * (self._player_speed_ms / 1000)
+        delay = max(0, int((ideal_next - time.perf_counter()) * 1000))
+        self._player_loop_id = self.root.after(delay, self._player_play_loop)
 
     def _player_stop_loop(self):
         if self._player_loop_id:
@@ -2404,7 +2453,17 @@ class StreakerDetectApp:
     def _player_set_realtime(self):
         ms = max(10, int(1000 / max(self._player_fps, 1)))
         self._player_speed_ms = ms
-        self._player_speed_var.set(ms)
+        self._player_speed_var.set(f'{ms}ms')
+
+    def _player_speed_faster(self):
+        ms = max(10, self._player_speed_ms - 10)
+        self._player_speed_ms = ms
+        self._player_speed_var.set(f'{ms}ms')
+
+    def _player_speed_slower(self):
+        ms = min(500, self._player_speed_ms + 10)
+        self._player_speed_ms = ms
+        self._player_speed_var.set(f'{ms}ms')
 
     def _player_toggle_composite(self):
         self._player_show_comp = not self._player_show_comp
@@ -2752,6 +2811,8 @@ def main():
 
     try:
         root = tk.Tk()
+        root.title(f"StreakerDetect  v{VERSION}")
+        root.state('zoomed')
 
         def _tk_cb_exception(exc_type, exc_value, exc_tb):
             msg = ''.join(traceback.format_exception(exc_type, exc_value, exc_tb))
