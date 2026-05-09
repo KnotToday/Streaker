@@ -5,6 +5,7 @@
 !/Get_TLE/
 !/Record/
 !/Sat_Calcs/
+!/Dahua_Display/
 
 # Streaker Detect — exclude build artifacts and generated output
 /Streaker Detect/build/
@@ -34,3 +35,11 @@
 # Sat_Calcs — exclude cache
 /Sat_Calcs/__pycache__/
 /Sat_Calcs/*.pyc
+
+# Dahua_Display — exclude credentials, build artifacts, and logs
+/Dahua_Display/dahua_display_config.json
+/Dahua_Display/build/
+/Dahua_Display/dist/
+/Dahua_Display/__pycache__/
+/Dahua_Display/*.pyc
+/Dahua_Display/*.log

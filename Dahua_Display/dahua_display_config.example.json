@@ -1,0 +1,5 @@
+{
+  "rtsp_url": "rtsp://user:password@192.168.x.x:554/cam/realmonitor?channel=1&subtype=0",
+  "window_width": 864,
+  "window_height": 648
+}
