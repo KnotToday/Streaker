@@ -1517,10 +1517,7 @@ class StreakerDetectApp:
                   font=('Arial', 9, 'bold'),
                   relief='flat', padx=10, pady=3).pack(side='left', padx=2)
 
-        self.stats_var = tk.StringVar(value="—")
-        tk.Label(btn_f2, textvariable=self.stats_var, bg=BG,
-                 fg='#aaffaa', font=('Courier', 14),
-                 justify='left').pack(side='left', padx=8)
+        self.stats_var = tk.StringVar(value="")
 
         self._update_btn = tk.Button(btn_f2, text="",
                                      bg=BG, fg='#ffaa00',
@@ -1849,6 +1846,7 @@ class StreakerDetectApp:
         self.run_btn.config(state='normal')
         self.stop_btn.config(state='disabled')
         self.progress_lbl.set("Stopped.")
+        self.root.title(f"StreakerDetect  v{VERSION}")
 
     # --------------------------------------------------------------------------
     # Queue Polling
@@ -1937,12 +1935,16 @@ class StreakerDetectApp:
         self.progress_lbl.set(
             f"{clip_info}{clip_name}  |  Frame {frame}/{total}  ({pct:.1f}%)  "
             f"ETA {eta_s//60:02d}:{eta_s%60:02d}")
-        self.stats_var.set(
-            f"Detections : {stats['detections']}\n"
-            f"Cloudy suppressed: {stats['cloudy']}\n"
-            f"Elapsed : {int(stats['elapsed']//60):02d}:{int(stats['elapsed']%60):02d}")
+        el = stats['elapsed']
+        self.root.title(
+            f"StreakerDetect  v{VERSION}  |  {clip_info}"
+            f"Frame {frame}/{total}  |  "
+            f"{stats['detections']} det  {stats['cloudy']} cloudy  |  "
+            f"Elapsed {int(el//60):02d}:{int(el%60):02d}  ETA {eta_s//60:02d}:{eta_s%60:02d}"
+        )
 
     def _on_done(self, result):
+        self.root.title(f"StreakerDetect  v{VERSION}")
         if 'error' in result:
             trace = result.get('trace', result['error'])
             try:
