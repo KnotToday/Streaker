@@ -1,5 +1,6 @@
 import sys
 import os
+import shutil
 import subprocess
 import builtins
 import traceback
@@ -15,6 +16,16 @@ from astral import LocationInfo
 from astral.sun import sun, elevation
 import pytz
 
+
+def _find_ffmpeg():
+    if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+        bundled = os.path.join(sys._MEIPASS, 'ffmpeg.exe')
+        if os.path.isfile(bundled):
+            return bundled
+    found = shutil.which('ffmpeg')
+    return found if found else 'ffmpeg'
+
+FFMPEG_PATH = _find_ffmpeg()
 
 # === Logging Setup ===
 
@@ -160,7 +171,7 @@ class StreamCapture:
                 filepath = os.path.join(output_folder, filename)
 
                 cmd = [
-                    "ffmpeg", "-hide_banner", "-rtsp_transport", "tcp", "-rtbufsize", "400M",
+                    FFMPEG_PATH, "-hide_banner", "-rtsp_transport", "tcp", "-rtbufsize", "400M",
                     "-i", self.rtsp_url.get(), "-map", "0:v:0", "-use_wallclock_as_timestamps", "1",
                     "-fflags", "+genpts", "-err_detect", "ignore_err", "-c", "copy",
                     "-avoid_negative_ts", "make_zero", "-t", str(chunk_seconds), filepath
