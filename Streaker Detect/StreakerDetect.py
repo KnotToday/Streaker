@@ -1229,7 +1229,7 @@ class EventStitcher:
 class StreakerDetectApp:
     def __init__(self, master):
         self.root = master
-        master.title("Streaker Detect")
+        master.title(f"StreakerDetect  v{VERSION}")
         master.configure(bg='#111111')
 
         self.input_path = tk.StringVar()

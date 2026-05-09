@@ -40,7 +40,8 @@ def _detect_hwaccel(ffmpeg_path):
     try:
         result = subprocess.run(
             [ffmpeg_path, '-hwaccels'],
-            capture_output=True, text=True, timeout=5
+            capture_output=True, text=True, timeout=5,
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
         )
         if 'cuda' in result.stdout.lower():
             return ['-hwaccel', 'cuda']
