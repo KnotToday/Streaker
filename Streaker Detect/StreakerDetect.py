@@ -1942,6 +1942,13 @@ class StreakerDetectApp:
 
     def _on_done(self, result):
         if 'error' in result:
+            trace = result.get('trace', result['error'])
+            try:
+                log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'streaker_error.log')
+                with open(log_path, 'a') as f:
+                    f.write(f'\n--- {datetime.now()} [worker] ---\n{trace}')
+            except Exception:
+                pass
             messagebox.showerror("Detection Error", result['error'])
             self.progress_lbl.set("Error.")
             self.run_btn.config(state='normal')
@@ -2809,6 +2816,17 @@ def main():
 
     sys.excepthook = _log_exception
 
+    # Catch unhandled exceptions in daemon/background threads
+    def _thread_exception(args):
+        msg = ''.join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback))
+        try:
+            with open(log_path, 'a') as f:
+                name = getattr(args.thread, 'name', 'unknown')
+                f.write(f'\n--- {datetime.now()} [thread:{name}] ---\n{msg}')
+        except Exception:
+            pass
+    threading.excepthook = _thread_exception
+
     try:
         root = tk.Tk()
         root.title(f"StreakerDetect  v{VERSION}")
@@ -2841,4 +2859,14 @@ def main():
         _log_exception(*sys.exc_info())
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        import traceback
+        _log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'streaker_error.log')
+        try:
+            with open(_log_path, 'a') as f:
+                f.write(f'\n--- {datetime.now()} [__main__] ---\n{traceback.format_exc()}')
+        except Exception:
+            pass
+        raise
