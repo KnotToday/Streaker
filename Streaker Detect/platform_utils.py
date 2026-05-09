@@ -62,3 +62,4 @@ def play_completion_sound():
 
 FFMPEG_PATH = find_ffmpeg()
 HWACCEL_ARGS = _detect_hwaccel(FFMPEG_PATH)
+NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0

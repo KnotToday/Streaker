@@ -30,7 +30,7 @@ except ImportError:
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])),
                            'streaker_config.json')
 
-from platform_utils import FFMPEG_PATH, HWACCEL_ARGS, play_completion_sound
+from platform_utils import FFMPEG_PATH, HWACCEL_ARGS, NO_WINDOW, play_completion_sound
 
 # ------------------------------------------------------------------------------
 # Detection Parameters (defaults — all tunable in GUI)
@@ -327,7 +327,8 @@ class DetectionWorker:
         self._ffmpeg_proc = subprocess.Popen(
             ffmpeg_cmd,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL)
+            stderr=subprocess.DEVNULL,
+            creationflags=NO_WINDOW)
         frame_bytes = fw * fh
 
         scale = self.params['scale']
@@ -1200,7 +1201,8 @@ class EventStitcher:
         ]
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                    stderr=subprocess.DEVNULL)
+                                    stderr=subprocess.DEVNULL,
+                                    creationflags=NO_WINDOW)
             # Get frame dimensions from first existing frame in out_dir
             sample = sorted([f for f in os.listdir(out_dir)
                              if f.startswith('frame_')])[0]
@@ -2160,7 +2162,7 @@ class StreakerDetectApp:
             cmd += ['--presource', src]
         if outdir:
             cmd += ['--preoutput', outdir]
-        subprocess.Popen(cmd)
+        subprocess.Popen(cmd, creationflags=NO_WINDOW)
 
     def _check_for_update(self):
         import urllib.request
@@ -2230,7 +2232,7 @@ class StreakerDetectApp:
         cmd = [sys.executable, compare_path]
         if src:
             cmd += ['--source', src]
-        subprocess.Popen(cmd)
+        subprocess.Popen(cmd, creationflags=NO_WINDOW)
 
     def _open_events_folder(self):
         folder = filedialog.askdirectory(title="Select Events Folder", initialdir=self.output_dir.get() or None)
@@ -2497,7 +2499,8 @@ class StreakerDetectApp:
         output_root = self.output_dir.get().strip() or os.path.dirname(__file__)
         subprocess.Popen([sys.executable, synth_py,
                           '--presource', self._player_tester_clip,
-                          '--preoutput', output_root])
+                          '--preoutput', output_root],
+                         creationflags=NO_WINDOW)
 
     def _player_auto_cut(self, event_dir):
         """Background thread: cut tester clip as soon as a thumbnail is clicked."""
@@ -2596,7 +2599,7 @@ class StreakerDetectApp:
                '-i', source_clip,
                '-t', f'{clip_dur:.3f}',
                '-c', 'copy', out_path]
-        ok = subprocess.run(cmd, capture_output=True).returncode == 0
+        ok = subprocess.run(cmd, capture_output=True, creationflags=NO_WINDOW).returncode == 0
         return out_path if ok and os.path.isfile(out_path) else None
 
     def _run_stitcher(self):
