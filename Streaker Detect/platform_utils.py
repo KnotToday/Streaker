@@ -7,7 +7,12 @@ import subprocess
 
 
 def find_ffmpeg():
-    """Discover ffmpeg: FFMPEG_PATH env var → system PATH → known Windows location."""
+    """Discover ffmpeg: bundled exe → FFMPEG_PATH env var → system PATH → known Windows location."""
+    # PyInstaller bundle: ffmpeg.exe is extracted alongside the app at runtime
+    if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+        bundled = os.path.join(sys._MEIPASS, 'ffmpeg.exe')
+        if os.path.isfile(bundled):
+            return bundled
     env = os.environ.get('FFMPEG_PATH') or os.environ.get('FFMPEG')
     if env and os.path.isfile(env):
         return env
