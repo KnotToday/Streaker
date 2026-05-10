@@ -328,18 +328,34 @@ class StreamCapture:
 
 
     def calculate_twilight_times(self):
-        location = LocationInfo("Custom", "World", "UTC", self.latitude.get(), self.longitude.get())
-        observer = location.observer
-        date_today = date.today()
-        self.civil_dusk = self.find_twilight(observer, date_today, angle=-6, is_dawn=False)
-        self.civil_dawn = self.find_twilight(observer, date_today, angle=-6, is_dawn=True)
-        self.nautical_dusk = self.find_twilight(observer, date_today, angle=-12, is_dawn=False)
-        self.nautical_dawn = self.find_twilight(observer, date_today, angle=-12, is_dawn=True)
-        self.start_midpoint = self.civil_dusk + (self.nautical_dusk - self.civil_dusk) / 2
-        self.start_midpoint += timedelta(minutes=self.start_time_offset.get())
-        self.end_midpoint = self.nautical_dawn + (self.civil_dawn - self.nautical_dawn) / 2 + timedelta(minutes=self.stop_time_offset.get())
-        self.start_time.set(self.start_midpoint.strftime("%H:%M"))
-        self.end_time.set(self.end_midpoint.strftime("%H:%M"))
+        try:
+            location = LocationInfo("Custom", "World", "UTC", self.latitude.get(), self.longitude.get())
+            observer = location.observer
+            date_today = date.today()
+            self.civil_dusk = self.find_twilight(observer, date_today, angle=-6, is_dawn=False)
+            self.civil_dawn = self.find_twilight(observer, date_today, angle=-6, is_dawn=True)
+            self.nautical_dusk = self.find_twilight(observer, date_today, angle=-12, is_dawn=False)
+            self.nautical_dawn = self.find_twilight(observer, date_today, angle=-12, is_dawn=True)
+            self.start_midpoint = self.civil_dusk + (self.nautical_dusk - self.civil_dusk) / 2
+            self.start_midpoint += timedelta(minutes=self.start_time_offset.get())
+            self.end_midpoint = self.nautical_dawn + (self.civil_dawn - self.nautical_dawn) / 2 + timedelta(minutes=self.stop_time_offset.get())
+            self.start_time.set(self.start_midpoint.strftime("%H:%M"))
+            self.end_time.set(self.end_midpoint.strftime("%H:%M"))
+        except Exception as e:
+            print(f"[ERROR] Twilight calculation failed: {e}")
+            # Fall back to fixed times so the GUI still opens
+            now_utc = datetime.now(pytz.UTC)
+            self.civil_dusk    = now_utc.replace(hour=20, minute=0, second=0, microsecond=0)
+            self.nautical_dusk = now_utc.replace(hour=20, minute=30, second=0, microsecond=0)
+            self.civil_dawn    = now_utc.replace(hour=5, minute=30, second=0, microsecond=0)
+            self.nautical_dawn = now_utc.replace(hour=5, minute=0, second=0, microsecond=0)
+            self.start_midpoint = self.civil_dusk
+            self.end_midpoint   = self.civil_dawn
+            self.start_time.set("20:00")
+            self.end_time.set("05:30")
+            messagebox.showwarning("Twilight Calculation Failed",
+                f"Could not calculate twilight times:\n{e}\n\nFalling back to fixed defaults. "
+                "Check your latitude/longitude in the config.")
 
     def display_twilight_times(self):
         local_tz = datetime.now().astimezone().tzinfo
@@ -488,3 +504,4 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"[ERROR] Exception in main loop: {e}")
         traceback.print_exc()
+        messagebox.showerror("STREAKERrec Error", f"Unexpected error:\n{e}\n\nSee log for details:\n{log_path}")
