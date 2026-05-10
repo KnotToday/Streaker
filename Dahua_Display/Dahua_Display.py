@@ -21,7 +21,7 @@ def _load_config():
     if _CONFIG_PATH.exists():
         with open(_CONFIG_PATH) as f:
             return json.load(f)
-    log.warning("Config not found at %s — copy dahua_display_config.example.json and fill in your settings.", _CONFIG_PATH)
+    print(f"WARNING: Config not found at {_CONFIG_PATH} — copy dahua_display_config.example.json and fill in your settings.")
     return {}
 
 _cfg = _load_config()
