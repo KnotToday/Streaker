@@ -817,8 +817,9 @@ PAGE_SIZE = 100
 class ThumbnailPanel:
     def __init__(self, parent, on_click):
         self.on_click   = on_click
-        self.thumbnails = []   # PhotoImage refs for current page
-        self.all_events = []   # every event_info ever added
+        self.thumbnails  = []   # PhotoImage refs for current page
+        self._flag_vars  = []   # StringVar refs for flag buttons (prevent GC)
+        self.all_events  = []   # every event_info ever added
         self.visited    = set()
         self.flagged    = set()
         self._flags_path = None
@@ -914,6 +915,7 @@ class ThumbnailPanel:
         for w in self.inner.winfo_children():
             w.destroy()
         self.thumbnails.clear()
+        self._flag_vars.clear()
         self.canvas.yview_moveto(0)
         start = self.page * PAGE_SIZE
         for i, ev in enumerate(self.all_events[start:start + PAGE_SIZE]):
@@ -939,6 +941,9 @@ class ThumbnailPanel:
             for gc in child.winfo_children():
                 try: gc.config(bg=bg)
                 except Exception: pass
+                for ggc in gc.winfo_children():
+                    try: ggc.config(bg=bg)
+                    except Exception: pass
 
     def _render_card(self, event_info, global_idx):
         event_dir    = event_info['dir']
@@ -966,34 +971,37 @@ class ThumbnailPanel:
                     Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)))
                 lbl = tk.Label(card, image=img, bg=card_bg, cursor='hand2')
                 lbl.image = img
-                lbl.pack(side='left', padx=4, pady=4)
+                lbl.pack(pady=(4, 0))
                 self.thumbnails.append(img)
                 lbl.bind('<Button-1>', lambda e, fn=_click: fn())
 
-        # Flag toggle button on right side
+        info = tk.Frame(card, bg=card_bg)
+        info.pack(fill='x', padx=6, pady=(2, 4))
+
+        top_row = tk.Frame(info, bg=card_bg)
+        top_row.pack(fill='x')
+        tk.Label(top_row, text=f"Event {global_idx + 1}",
+                 bg=card_bg, fg='white',
+                 font=('Arial', 10, 'bold')).pack(side='left')
         flag_text = tk.StringVar(value="⭐" if event_dir in self.flagged else "☆")
+        self._flag_vars.append(flag_text)
         def _toggle(d=event_dir, c=card, v=flag_text):
             self._toggle_flag(d, c, v)
-        tk.Button(card, textvariable=flag_text, command=_toggle,
+        tk.Button(top_row, textvariable=flag_text, command=_toggle,
                   bg=card_bg, fg='#ffd700', activebackground=card_bg,
-                  font=('Arial', 14), relief='flat', cursor='hand2',
-                  bd=0, padx=4).pack(side='right', anchor='center', padx=4)
+                  font=('Arial', 12), relief='flat', cursor='hand2',
+                  bd=0).pack(side='right')
 
-        info = tk.Frame(card, bg=card_bg)
-        info.pack(side='left', fill='both', expand=True, padx=6)
-        tk.Label(info, text=f"Event {global_idx + 1}",
-                 bg=card_bg, fg='white',
-                 font=('Arial', 10, 'bold')).pack(anchor='w')
         tk.Label(info, text=os.path.basename(event_dir),
                  bg=card_bg, fg='#888888',
                  font=('Arial', 8)).pack(anchor='w')
         tk.Label(info, text=f"{n_frames} frames  |  {n_detections} detections",
                  bg=card_bg, fg='#aaffaa',
-                 font=('Arial', 9)).pack(anchor='w', pady=(4, 0))
+                 font=('Arial', 9)).pack(anchor='w', pady=(2, 0))
         tk.Button(info, text="▶ View Clip",
                   command=_click,
                   bg='#3a3a3a', fg='white', relief='flat',
-                  cursor='hand2').pack(anchor='w', pady=(6, 0))
+                  cursor='hand2').pack(anchor='w', pady=(4, 0))
 
     def _highlight_card(self, card):
         self._apply_card_colors(card, card._event_dir)
@@ -1092,6 +1100,7 @@ class ThumbnailPanel:
         for w in self.inner.winfo_children():
             w.destroy()
         self.thumbnails.clear()
+        self._flag_vars.clear()
         self.all_events.clear()
         self.visited.clear()
         self.flagged.clear()
@@ -2355,10 +2364,24 @@ class StreakerDetectApp:
         if not folder or not os.path.isdir(folder):
             return
 
-        event_dirs = sorted([
-            os.path.join(folder, d) for d in os.listdir(folder)
-            if d.startswith('event_') and
-            os.path.isdir(os.path.join(folder, d))])
+        entries = os.listdir(folder)
+
+        # First look for event_ folders directly in this folder
+        event_dirs = sorted(
+            os.path.join(folder, d) for d in entries
+            if d.startswith('event_') and os.path.isdir(os.path.join(folder, d)))
+        source_label = os.path.basename(folder)
+
+        if not event_dirs:
+            # No direct events — search one level deeper in every subfolder
+            sub_dirs = sorted(d for d in entries if os.path.isdir(os.path.join(folder, d)))
+            for sd in sub_dirs:
+                sd_path = os.path.join(folder, sd)
+                event_dirs += sorted(
+                    os.path.join(sd_path, d) for d in os.listdir(sd_path)
+                    if d.startswith('event_') and os.path.isdir(os.path.join(sd_path, d)))
+            if event_dirs:
+                source_label = f"{os.path.basename(folder)} ({len(sub_dirs)} subfolders)"
 
         if not event_dirs:
             messagebox.showinfo("No Events", "No event_ subfolders found in that folder.")
@@ -2390,7 +2413,7 @@ class StreakerDetectApp:
                 'count':  0,
             })
 
-        self.progress_lbl.set(f"Loaded {len(event_dirs)} events from {os.path.basename(folder)}")
+        self.progress_lbl.set(f"Loaded {len(event_dirs)} events from {source_label}")
 
     def _open_event_viewer(self, event_dir):
         self._load_event(event_dir)
