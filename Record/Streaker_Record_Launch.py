@@ -467,7 +467,8 @@ class StreamCapture:
             messagebox.showerror("Invalid Coordinates", f"Latitude/Longitude must be valid numbers.\n{e}")
 
     def find_twilight(self, observer, date_obj, angle, is_dawn):
-        tz = pytz.UTC
+        import datetime as _dt
+        tz = _dt.timezone.utc
         base_time = sun(observer, date_obj, tzinfo=tz)["sunrise"] if is_dawn else sun(observer, date_obj, tzinfo=tz)["sunset"]
         start_time = base_time - timedelta(hours=3) if is_dawn else base_time
         end_time = base_time if is_dawn else base_time + timedelta(hours=3)
