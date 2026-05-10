@@ -48,7 +48,7 @@ DEFAULT_WARMUP_FRAMES      = 200
 DEFAULT_CLOUD_THRESH       = 80
 DEFAULT_CLOUD_RATIO        = 0.15
 
-VERSION      = "1.0.0"
+VERSION      = "1.1.0"
 GITHUB_REPO  = "KnotToday/Streaker"
 
 THUMB_W  = 320
@@ -820,6 +820,8 @@ class ThumbnailPanel:
         self.thumbnails = []   # PhotoImage refs for current page
         self.all_events = []   # every event_info ever added
         self.visited    = set()
+        self.flagged    = set()
+        self._flags_path = None
         self.page = 0
 
         BG = '#1a1a1a'
@@ -842,6 +844,19 @@ class ThumbnailPanel:
         self.page_var = tk.StringVar(value="")
         tk.Label(hdr, textvariable=self.page_var, bg=BG, fg='#666666',
                  font=('Arial', 8)).pack(side='right', padx=4)
+
+        # Footer row: flag count + delete unflagged button
+        footer = tk.Frame(frame, bg=BG)
+        footer.pack(fill='x', side='bottom')
+        self.flag_count_lbl = tk.Label(footer, text="", bg=BG, fg='#888888',
+                                       font=('Arial', 8))
+        self.flag_count_lbl.pack(side='left', padx=6, pady=2)
+        self.delete_btn = tk.Button(footer, text="🗑 Delete Unflagged",
+                                    command=self._delete_unflagged,
+                                    bg='#3a1a1a', fg='#ff6666',
+                                    font=('Arial', 8), relief='flat', padx=6,
+                                    state='disabled')
+        self.delete_btn.pack(side='right', padx=4, pady=2)
 
         container = tk.Frame(frame, bg=BG)
         container.pack(fill='both', expand=True)
@@ -906,24 +921,42 @@ class ThumbnailPanel:
         self._update_nav()
         self.canvas.after_idle(self._refresh_scrollregion)
 
+    def _card_colors(self, event_dir):
+        """Return (bg, border_color, border_thickness) based on flagged/visited state."""
+        if event_dir in self.flagged:
+            return '#2a2410', '#ffd700', 2
+        elif event_dir in self.visited:
+            return '#1a3a22', '#33aa55', 2
+        else:
+            return '#2a2a2a', '#2a2a2a', 0
+
+    def _apply_card_colors(self, card, event_dir):
+        bg, border, thickness = self._card_colors(event_dir)
+        card.config(bg=bg, highlightbackground=border, highlightthickness=thickness)
+        for child in card.winfo_children():
+            try: child.config(bg=bg)
+            except Exception: pass
+            for gc in child.winfo_children():
+                try: gc.config(bg=bg)
+                except Exception: pass
+
     def _render_card(self, event_info, global_idx):
         event_dir    = event_info['dir']
         thumb_path   = event_info['thumb']
         n_frames     = event_info['frames']
         n_detections = event_info['count']
 
-        visited   = event_dir in self.visited
-        card_bg   = '#1a3a22' if visited else '#2a2a2a'
+        card_bg, border, thickness = self._card_colors(event_dir)
         card = tk.Frame(self.inner, bg=card_bg,
-                        highlightbackground='#33aa55' if visited else '#2a2a2a',
-                        highlightthickness=2 if visited else 0,
+                        highlightbackground=border,
+                        highlightthickness=thickness,
                         relief='flat', bd=0)
         card._event_dir = event_dir
         card.pack(fill='x', padx=6, pady=4)
 
         def _click(d=event_dir, c=card):
             self.visited.add(d)
-            self._highlight_card(c)
+            self._apply_card_colors(c, d)
             self.on_click(d)
 
         if os.path.exists(thumb_path):
@@ -936,6 +969,15 @@ class ThumbnailPanel:
                 lbl.pack(side='left', padx=4, pady=4)
                 self.thumbnails.append(img)
                 lbl.bind('<Button-1>', lambda e, fn=_click: fn())
+
+        # Flag toggle button on right side
+        flag_text = tk.StringVar(value="⭐" if event_dir in self.flagged else "☆")
+        def _toggle(d=event_dir, c=card, v=flag_text):
+            self._toggle_flag(d, c, v)
+        tk.Button(card, textvariable=flag_text, command=_toggle,
+                  bg=card_bg, fg='#ffd700', activebackground=card_bg,
+                  font=('Arial', 14), relief='flat', cursor='hand2',
+                  bd=0, padx=4).pack(side='right', anchor='center', padx=4)
 
         info = tk.Frame(card, bg=card_bg)
         info.pack(side='left', fill='both', expand=True, padx=6)
@@ -954,14 +996,7 @@ class ThumbnailPanel:
                   cursor='hand2').pack(anchor='w', pady=(6, 0))
 
     def _highlight_card(self, card):
-        bg = '#1a3a22'
-        card.config(bg=bg, highlightbackground='#33aa55', highlightthickness=2)
-        for child in card.winfo_children():
-            try: child.config(bg=bg)
-            except Exception: pass
-            for grandchild in child.winfo_children():
-                try: grandchild.config(bg=bg)
-                except Exception: pass
+        self._apply_card_colors(card, card._event_dir)
 
     def select_event(self, event_dir):
         """Highlight the card for event_dir; switch page if needed and scroll to it."""
@@ -987,22 +1022,96 @@ class ThumbnailPanel:
         frac = max(0.0, min(1.0, (card.winfo_y() - 40) / total))
         self.canvas.yview_moveto(frac)
 
+    def _toggle_flag(self, event_dir, card, flag_var):
+        if event_dir in self.flagged:
+            self.flagged.discard(event_dir)
+            flag_var.set("☆")
+        else:
+            self.flagged.add(event_dir)
+            flag_var.set("⭐")
+        self._apply_card_colors(card, event_dir)
+        self._save_flags()
+        self._update_delete_btn()
+
+    def _load_flags(self):
+        if self._flags_path and os.path.exists(self._flags_path):
+            try:
+                with open(self._flags_path) as f:
+                    self.flagged = set(json.load(f))
+            except Exception:
+                self.flagged = set()
+
+    def _save_flags(self):
+        if self._flags_path:
+            try:
+                with open(self._flags_path, 'w') as f:
+                    json.dump(list(self.flagged), f)
+            except Exception:
+                pass
+
+    def _update_delete_btn(self):
+        n_flagged   = sum(1 for e in self.all_events if e['dir'] in self.flagged)
+        n_unflagged = len(self.all_events) - n_flagged
+        if n_flagged > 0 and n_unflagged > 0:
+            self.delete_btn.config(state='normal')
+            self.flag_count_lbl.config(text=f"{n_flagged} flagged  ·  {n_unflagged} unflagged")
+        elif n_flagged > 0:
+            self.delete_btn.config(state='disabled')
+            self.flag_count_lbl.config(text=f"All {n_flagged} flagged")
+        elif len(self.all_events) > 0:
+            self.delete_btn.config(state='disabled')
+            self.flag_count_lbl.config(text=f"{len(self.all_events)} clips  ·  none flagged")
+        else:
+            self.delete_btn.config(state='disabled')
+            self.flag_count_lbl.config(text="")
+
+    def _delete_unflagged(self):
+        import shutil
+        unflagged = [e for e in self.all_events if e['dir'] not in self.flagged]
+        n = len(unflagged)
+        n_keep = len(self.all_events) - n
+        if not messagebox.askyesno(
+                "Delete Unflagged",
+                f"Permanently delete {n} unflagged clip folder{'s' if n != 1 else ''}?\n"
+                f"({n_keep} flagged clip{'s' if n_keep != 1 else ''} will be kept)\n\n"
+                "This cannot be undone."):
+            return
+        errors = []
+        for e in unflagged:
+            try:
+                shutil.rmtree(e['dir'])
+            except Exception as ex:
+                errors.append(f"{os.path.basename(e['dir'])}: {ex}")
+        self.all_events = [e for e in self.all_events if e['dir'] in self.flagged]
+        self._render_page()
+        self._update_delete_btn()
+        if errors:
+            messagebox.showerror("Delete Errors", "\n".join(errors))
+
     def clear(self):
         for w in self.inner.winfo_children():
             w.destroy()
         self.thumbnails.clear()
         self.all_events.clear()
         self.visited.clear()
+        self.flagged.clear()
+        self._flags_path = None
         self.page = 0
         self._update_nav()
+        self._update_delete_btn()
 
     def add_event(self, event_info):
+        if self._flags_path is None:
+            clips_dir = os.path.dirname(event_info['dir'])
+            self._flags_path = os.path.join(clips_dir, '_flags.json')
+            self._load_flags()
         self.all_events.append(event_info)
         # Only render if this event falls on the current page
         idx = len(self.all_events) - 1
         if self.page * PAGE_SIZE <= idx < (self.page + 1) * PAGE_SIZE:
             self._render_card(event_info, idx)
         self._update_nav()
+        self._update_delete_btn()
 
 # ------------------------------------------------------------------------------
 # Event Stitcher — merges fragmented events from the same object
