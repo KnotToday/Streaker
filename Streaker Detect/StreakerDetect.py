@@ -614,8 +614,6 @@ class DetectionWorker:
 
         det_meta = []
         for (fidx, gframe, fcount, fbboxes, _) in pending:
-            fpath = os.path.join(event_dir, f"frame_{fidx:06d}.jpg")
-            cv2.imwrite(fpath, gframe, [cv2.IMWRITE_JPEG_QUALITY, 90])
             if fbboxes:
                 centroids = [[x + w//2, y + h//2] for (x, y, w, h) in fbboxes]
                 det_meta.append({
@@ -624,6 +622,26 @@ class DetectionWorker:
                     'bboxes': [list(b) for b in fbboxes],
                     'count': fcount,
                 })
+
+        # Write clip.mkv by piping grayscale frames into FFmpeg
+        clip_path = os.path.join(event_dir, 'clip.mkv')
+        fh, fw = pending[0][1].shape[:2]
+        ffmpeg_cmd = [
+            FFMPEG_PATH, '-y',
+            '-f', 'rawvideo', '-pix_fmt', 'gray',
+            '-s', f'{fw}x{fh}', '-r', str(fps),
+            '-i', 'pipe:0',
+            '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
+            '-pix_fmt', 'yuv420p',
+            clip_path,
+        ]
+        proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                creationflags=NO_WINDOW)
+        for (_, gframe, _, _, _) in pending:
+            proc.stdin.write(gframe.tobytes())
+        proc.stdin.close()
+        proc.wait()
 
         detect_scale = self.params.get('scale', 1.0)
         all_detections = [(fbboxes, fmask) for (_, _, _, fbboxes, fmask) in pending if fbboxes]
@@ -1061,16 +1079,16 @@ class ThumbnailPanel:
         n_flagged   = sum(1 for e in self.all_events if e['dir'] in self.flagged)
         n_unflagged = len(self.all_events) - n_flagged
         if n_flagged > 0 and n_unflagged > 0:
-            self.delete_btn.config(state='normal')
+            self.delete_btn.config(state='normal', text="🗑 Delete Unflagged")
             self.flag_count_lbl.config(text=f"{n_flagged} flagged  ·  {n_unflagged} unflagged")
         elif n_flagged > 0:
-            self.delete_btn.config(state='disabled')
+            self.delete_btn.config(state='disabled', text="🗑 Delete Unflagged")
             self.flag_count_lbl.config(text=f"All {n_flagged} flagged")
         elif len(self.all_events) > 0:
-            self.delete_btn.config(state='disabled')
+            self.delete_btn.config(state='normal', text="🗑 Delete All")
             self.flag_count_lbl.config(text=f"{len(self.all_events)} clips  ·  none flagged")
         else:
-            self.delete_btn.config(state='disabled')
+            self.delete_btn.config(state='disabled', text="🗑 Delete Unflagged")
             self.flag_count_lbl.config(text="")
 
     def _delete_unflagged(self):
@@ -1078,11 +1096,16 @@ class ThumbnailPanel:
         unflagged = [e for e in self.all_events if e['dir'] not in self.flagged]
         n = len(unflagged)
         n_keep = len(self.all_events) - n
-        if not messagebox.askyesno(
-                "Delete Unflagged",
+        if n_keep == 0:
+            title, msg = "Delete All", (
+                f"Permanently delete all {n} clip folder{'s' if n != 1 else ''}?\n\n"
+                "This cannot be undone.")
+        else:
+            title, msg = "Delete Unflagged", (
                 f"Permanently delete {n} unflagged clip folder{'s' if n != 1 else ''}?\n"
                 f"({n_keep} flagged clip{'s' if n_keep != 1 else ''} will be kept)\n\n"
-                "This cannot be undone."):
+                "This cannot be undone.")
+        if not messagebox.askyesno(title, msg):
             return
         errors = []
         for e in unflagged:
@@ -1394,6 +1417,7 @@ class StreakerDetectApp:
         self._player_show_comp   = False
         self._player_loop_id     = None
         self._player_event_dir   = None
+        self._player_mkv_path    = None   # set when event was saved as MKV
         self._play_clock_start   = 0.0
         self._play_clock_frame   = 0
         self._player_scrubbing   = False
@@ -2392,19 +2416,35 @@ class StreakerDetectApp:
 
         for event_dir in event_dirs:
             thumb_path = os.path.join(event_dir, '_thumbnail.jpg')
+            clip_path  = os.path.join(event_dir, 'clip.mkv')
             frame_files = [f for f in os.listdir(event_dir)
                            if f.startswith('frame_') and f.endswith('.jpg')]
-            n_frames = len(frame_files)
 
-            # Regenerate thumbnail if missing
-            if not os.path.exists(thumb_path) and frame_files:
-                grays = [cv2.imread(os.path.join(event_dir, f),
-                                    cv2.IMREAD_GRAYSCALE)
-                         for f in sorted(frame_files)]
-                grays = [g for g in grays if g is not None]
-                thumb_bgr = make_thumbnail(grays)
-                if thumb_bgr is not None:
-                    cv2.imwrite(thumb_path, thumb_bgr)
+            if os.path.exists(clip_path):
+                cap = cv2.VideoCapture(clip_path)
+                n_frames = max(0, int(cap.get(cv2.CAP_PROP_FRAME_COUNT)))
+                # Regenerate thumbnail from MKV if missing
+                if not os.path.exists(thumb_path):
+                    grays = []
+                    while True:
+                        ret, frame = cap.read()
+                        if not ret:
+                            break
+                        grays.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+                    thumb_bgr = make_thumbnail(grays)
+                    if thumb_bgr is not None:
+                        cv2.imwrite(thumb_path, thumb_bgr)
+                cap.release()
+            else:
+                n_frames = len(frame_files)
+                # Regenerate thumbnail from JPEGs if missing
+                if not os.path.exists(thumb_path) and frame_files:
+                    grays = [cv2.imread(os.path.join(event_dir, f), cv2.IMREAD_GRAYSCALE)
+                             for f in sorted(frame_files)]
+                    grays = [g for g in grays if g is not None]
+                    thumb_bgr = make_thumbnail(grays)
+                    if thumb_bgr is not None:
+                        cv2.imwrite(thumb_path, thumb_bgr)
 
             self.thumb_panel.add_event({
                 'dir':    event_dir,
@@ -2423,37 +2463,68 @@ class StreakerDetectApp:
     # --------------------------------------------------------------------------
 
     def _load_event(self, event_dir):
-        frame_paths = sorted([
+        clip_path   = os.path.join(event_dir, 'clip.mkv')
+        use_mkv     = os.path.exists(clip_path)
+        frame_paths = [] if use_mkv else sorted([
             os.path.join(event_dir, f) for f in os.listdir(event_dir)
             if f.startswith('frame_') and f.endswith('.jpg')])
-        if not frame_paths:
+
+        if use_mkv:
+            cap = cv2.VideoCapture(clip_path)
+            n_frames = max(1, int(cap.get(cv2.CAP_PROP_FRAME_COUNT)))
+            cap.release()
+        else:
+            n_frames = len(frame_paths)
+
+        if n_frames == 0:
             return
 
         self._player_stop_loop()
-        self._player_frames      = frame_paths
-        self._player_frame_cache = [None] * len(frame_paths)
+        self._player_frames      = list(range(n_frames)) if use_mkv else frame_paths
+        self._player_frame_cache = [None] * n_frames
         self._player_event_dir   = event_dir
+        self._player_mkv_path    = clip_path if use_mkv else None
         self._player_idx         = 0
         self._player_paused      = True
         self._player_show_comp   = False
         self._player_composite   = None
 
-        def _preload_frames(paths, target_dir):
-            cw = self.preview_canvas.winfo_width()  or 640
-            ch = self.preview_canvas.winfo_height() or 480
-            for i, p in enumerate(paths):
-                if self._player_event_dir != target_dir:
-                    return
-                img = cv2.imread(p, cv2.IMREAD_COLOR)
-                if img is None:
-                    continue
-                h, w = img.shape[:2]
-                scale = min(cw / w, ch / h)
-                nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
-                resized = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA)
-                self._player_frame_cache[i] = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-
-        threading.Thread(target=_preload_frames, args=(frame_paths, event_dir), daemon=True).start()
+        if use_mkv:
+            def _preload_mkv(path, target_dir):
+                cap = cv2.VideoCapture(path)
+                cw = self.preview_canvas.winfo_width()  or 640
+                ch = self.preview_canvas.winfo_height() or 480
+                i = 0
+                while i < len(self._player_frame_cache):
+                    if self._player_event_dir != target_dir:
+                        break
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    h, w = frame.shape[:2]
+                    scale = min(cw / w, ch / h)
+                    nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
+                    resized = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
+                    self._player_frame_cache[i] = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+                    i += 1
+                cap.release()
+            threading.Thread(target=_preload_mkv, args=(clip_path, event_dir), daemon=True).start()
+        else:
+            def _preload_frames(paths, target_dir):
+                cw = self.preview_canvas.winfo_width()  or 640
+                ch = self.preview_canvas.winfo_height() or 480
+                for i, p in enumerate(paths):
+                    if self._player_event_dir != target_dir:
+                        return
+                    img = cv2.imread(p, cv2.IMREAD_COLOR)
+                    if img is None:
+                        continue
+                    h, w = img.shape[:2]
+                    scale = min(cw / w, ch / h)
+                    nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
+                    resized = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA)
+                    self._player_frame_cache[i] = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+            threading.Thread(target=_preload_frames, args=(frame_paths, event_dir), daemon=True).start()
         self._player_tester_clip = None
         self._player_blend_btn.config(bg='#252525')
         self._player_tester_btn.config(text='✂ Cutting…', state='disabled', bg='#2a2a2a')
@@ -2468,8 +2539,18 @@ class StreakerDetectApp:
             self._player_fps = 20.0
 
         def _build_comp():
-            raw = [cv2.imread(p, cv2.IMREAD_GRAYSCALE) for p in frame_paths]
-            raw = [f for f in raw if f is not None]
+            if use_mkv:
+                cap = cv2.VideoCapture(clip_path)
+                raw = []
+                while True:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    raw.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+                cap.release()
+            else:
+                raw = [cv2.imread(p, cv2.IMREAD_GRAYSCALE) for p in frame_paths]
+                raw = [f for f in raw if f is not None]
             if not raw:
                 return None
             comp = raw[0].copy().astype(np.float32)
@@ -2522,7 +2603,7 @@ class StreakerDetectApp:
                 rgb = cached
                 cw = self.preview_canvas.winfo_width()  or 640
                 ch = self.preview_canvas.winfo_height() or 480
-            else:
+            elif isinstance(self._player_frames[self._player_idx], str):
                 img_bgr = cv2.imread(self._player_frames[self._player_idx], cv2.IMREAD_COLOR)
                 if img_bgr is None:
                     return
@@ -2533,6 +2614,8 @@ class StreakerDetectApp:
                 nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
                 resized = cv2.resize(img_bgr, (nw, nh), interpolation=cv2.INTER_AREA)
                 rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+            else:
+                return  # MKV cache not yet loaded for this frame
         else:
             return
         img = ImageTk.PhotoImage(Image.fromarray(rgb))
