@@ -48,7 +48,7 @@ DEFAULT_WARMUP_FRAMES      = 200
 DEFAULT_CLOUD_THRESH       = 80
 DEFAULT_CLOUD_RATIO        = 0.15
 
-VERSION      = "1.1.0"
+VERSION      = "1.2.0"
 GITHUB_REPO  = "KnotToday/Streaker"
 
 THUMB_W  = 320
