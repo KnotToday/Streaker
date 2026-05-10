@@ -99,13 +99,21 @@ def resize_into(image, buf, win_w, win_h):
 
 
 def main():
+    import tkinter.messagebox as _mb
     global CURSOR_HIDDEN
     log.info("Starting Dahua Display")
+
+    if RTSP_URL.startswith("rtsp://user:password"):
+        _mb.showerror("Config Missing",
+            f"No config file found.\n\nCreate dahua_display_config.json next to the exe:\n{_CONFIG_PATH}")
+        return
+
     cap = cv2.VideoCapture(RTSP_URL, cv2.CAP_FFMPEG)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)   # 1 frame internal buffer — we want latest, not stale
 
     if not cap.isOpened():
         log.error("Could not open RTSP stream: %s", RTSP_URL)
+        _mb.showerror("Connection Failed", f"Could not open RTSP stream:\n{RTSP_URL}")
         return
 
     screen_width, screen_height = get_screen_size()
