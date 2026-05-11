@@ -4,8 +4,8 @@ a = Analysis(
     ['StreakerDetect.py'],
     pathex=[],
     binaries=[
-        (r'C:\Program Files\FFMPEG\ffmpeg-2024-03-04-git-e30369bc1c-full_build\bin\ffmpeg.exe', '.'),
-        (r'C:\Program Files\FFMPEG\ffmpeg-2024-03-04-git-e30369bc1c-full_build\bin\ffprobe.exe', '.'),
+        (r'bin\ffmpeg.exe', '.'),
+        (r'bin\ffprobe.exe', '.'),
     ],
     datas=[],
     hiddenimports=[],

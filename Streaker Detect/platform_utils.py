@@ -41,14 +41,23 @@ def find_ffprobe(ffmpeg_path):
 
 
 def _detect_hwaccel(ffmpeg_path):
-    """Return ['-hwaccel', 'cuda'] if CUDA is available, else []."""
+    """Return ['-hwaccel', 'cuda'] only if a CUDA device is actually usable, else []."""
     try:
         result = subprocess.run(
             [ffmpeg_path, '-hwaccels'],
             capture_output=True, text=True, timeout=5,
             creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
         )
-        if 'cuda' in result.stdout.lower():
+        if 'cuda' not in result.stdout.lower():
+            return []
+        # Verify a CUDA device is actually present by attempting a null decode
+        probe = subprocess.run(
+            [ffmpeg_path, '-hwaccel', 'cuda', '-f', 'lavfi', '-i', 'nullsrc=s=64x64:d=1',
+             '-f', 'null', '-'],
+            capture_output=True, timeout=8,
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+        )
+        if probe.returncode == 0:
             return ['-hwaccel', 'cuda']
     except Exception:
         pass
