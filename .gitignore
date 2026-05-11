@@ -10,6 +10,7 @@
 # Streaker Detect — exclude build artifacts and generated output
 /Streaker Detect/build/
 /Streaker Detect/dist/
+/Streaker Detect/bin/
 /Streaker Detect/__pycache__/
 /Streaker Detect/*.pyc
 /Streaker Detect/synth_test_results/
