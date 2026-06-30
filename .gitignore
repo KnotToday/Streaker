@@ -5,7 +5,7 @@
 !/Get_TLE/
 !/Record/
 !/Sat_Calcs/
-!/Dahua_Display/
+!/Streaker_Display/
 
 # Streaker Detect — exclude build artifacts and generated output
 /Streaker Detect/build/
@@ -25,8 +25,9 @@
 /Get_TLE/TLEz/
 /Get_TLE/*.log
 
-# Record — exclude credentials and build artifacts
+# Record — exclude credentials, build artifacts, and logs
 /Record/stream_capture_config.json
+/Record/logs/
 /Record/build/
 /Record/dist/
 /Record/python/
@@ -37,10 +38,10 @@
 /Sat_Calcs/__pycache__/
 /Sat_Calcs/*.pyc
 
-# Dahua_Display — exclude credentials, build artifacts, and logs
-/Dahua_Display/dahua_display_config.json
-/Dahua_Display/build/
-/Dahua_Display/dist/
-/Dahua_Display/__pycache__/
-/Dahua_Display/*.pyc
-/Dahua_Display/*.log
+# Streaker_Display — exclude credentials, build artifacts, and logs
+/Streaker_Display/streaker_display_config.json
+/Streaker_Display/build/
+/Streaker_Display/dist/
+/Streaker_Display/__pycache__/
+/Streaker_Display/*.pyc
+/Streaker_Display/*.log

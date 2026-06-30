@@ -74,6 +74,55 @@ def play_completion_sound():
             pass
 
 
+def find_python():
+    """Return a real Python interpreter path, even when running as a frozen exe."""
+    if not getattr(sys, 'frozen', False):
+        return sys.executable
+    # Prefer Environ1 venv — project dependencies (astropy, cv2, etc.) live there
+    environ1 = os.path.join(os.path.expanduser('~'),
+                            'PythonTrials', 'Environ1', 'Scripts', 'python.exe')
+    if os.path.isfile(environ1):
+        return environ1
+    for name in ('python.exe', 'python3.exe', 'python', 'python3'):
+        found = shutil.which(name)
+        if found:
+            return found
+    if sys.platform == 'win32':
+        try:
+            import winreg
+            for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+                for reg_path in (r'SOFTWARE\Python\PythonCore',
+                                 r'SOFTWARE\WOW6432Node\Python\PythonCore'):
+                    try:
+                        with winreg.OpenKey(hive, reg_path) as key:
+                            i = 0
+                            while True:
+                                try:
+                                    version = winreg.EnumKey(key, i)
+                                    with winreg.OpenKey(key, version + r'\InstallPath') as ikey:
+                                        install_dir = winreg.QueryValueEx(ikey, '')[0]
+                                        candidate = os.path.join(install_dir, 'python.exe')
+                                        if os.path.isfile(candidate):
+                                            return candidate
+                                except OSError:
+                                    break
+                                i += 1
+                    except OSError:
+                        pass
+        except ImportError:
+            pass
+    return sys.executable  # last resort
+
+
+def find_companion_script(script_name):
+    """Return the path to a companion .py script whether running frozen or from source."""
+    if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+        return os.path.join(sys._MEIPASS, script_name)
+    here = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(here, script_name)
+
+
 FFMPEG_PATH = find_ffmpeg()
 HWACCEL_ARGS = _detect_hwaccel(FFMPEG_PATH)
 NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+PYTHON_EXE = find_python()

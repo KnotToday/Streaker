@@ -63,12 +63,15 @@ PARAM_DEFS = [
     ('warmup',       'Warmup',        50,    500,   50,  200),
     ('pre_buffer',   'Pre Buf',        5,    120,    5,   30),
     ('post_buffer',  'Post Buf',       5,    120,    5,   30),
-    ('min_bright',   'Min Bright',     0,    255,    5,    0),
-    ('min_move',     'Min Move',       0,     50,    1,    0),
-    ('min_travel',   'Min Travel',     0,    100,    5,    0),
-    ('cloud_thresh', 'Cloud Sens',    20,    200,    5,   40),
-    ('cloud_ratio',  'Cloud Ratio', 0.01,   0.50, 0.01, 0.15),
-    ('scale',        'Scale',       0.25,    1.0, 0.25,  0.5),
+    ('min_bright',        'Min Bright',      0,    255,    5,    0),
+    ('min_move',          'Min Move',        0,     50,    1,    0),
+    ('min_travel',        'Min Travel',      0,    100,    5,    0),
+    ('cloud_thresh',      'Cloud Sens',     20,    200,    5,   40),
+    ('cloud_ratio',       'Cloud Ratio',  0.01,   0.50, 0.01, 0.15),
+    ('max_match_dist',    'Match Dist',      0,    300,    5,   80),
+    ('cloud_min_bright',  'Cld MinBright',   0,    255,    5,    0),
+    ('cloud_min_travel',  'Cld MinTravel',   0,    100,    5,    0),
+    ('scale',             'Scale',        0.25,    1.0, 0.25,  0.5),
 ]
 
 # Thumbnail dimensions for the comparison grid
@@ -95,7 +98,7 @@ def run_detection_pass(mkv_path, mask_path, params, progress_cb=None, stop_event
 
     cap = cv2.VideoCapture(mkv_path)
     if not cap.isOpened():
-        return events
+        return events, 0, 0
     total  = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
     fw     = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     fh_px  = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -130,7 +133,8 @@ def run_detection_pass(mkv_path, mask_path, params, progress_cb=None, stop_event
         history=int(params.get('history', 500)),
         varThreshold=float(params.get('threshold', 40)),
         detectShadows=False)
-    tracker       = TrackManager(max_frames=int(params.get('max_track', 10)))
+    tracker       = TrackManager(max_frames=int(params.get('max_track', 10)),
+                                 max_match_dist=int(params.get('max_match_dist', 0)))
     kernel        = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     cloud_det     = AdaptiveCloudDetector(window=200)
 
@@ -195,7 +199,7 @@ def run_detection_pass(mkv_path, mask_path, params, progress_cb=None, stop_event
                 pending.append(entry)
                 post_cd -= 1
                 if post_cd == 0:
-                    ev = _build_event(pending, fps)
+                    ev = _build_event(pending, fps, inv_scale=1.0/scale if scale else 1.0)
                     if ev:
                         events.append(ev)
                     pending = []
@@ -210,14 +214,14 @@ def run_detection_pass(mkv_path, mask_path, params, progress_cb=None, stop_event
 
     # Flush any trailing event
     if pending:
-        ev = _build_event(pending, fps)
+        ev = _build_event(pending, fps, inv_scale=1.0/scale if scale else 1.0)
         if ev:
             events.append(ev)
 
-    return events
+    return events, fw, fh_px
 
 
-def _build_event(pending, fps):
+def _build_event(pending, fps, inv_scale=1.0):
     """Convert a list of (frame_idx, gray, count, bboxes) tuples into an event dict."""
     if not pending:
         return None
@@ -228,6 +232,13 @@ def _build_event(pending, fps):
     frames_bgr = []
     for (_fidx, gray, _c, _b) in pending:
         frames_bgr.append(cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR))
+
+    # Collect all bboxes scaled back to full resolution
+    all_bboxes = []
+    for (_fidx, _gray, _c, bboxes) in pending:
+        for (x, y, w, h) in bboxes:
+            all_bboxes.append((int(x * inv_scale), int(y * inv_scale),
+                               int(w * inv_scale), int(h * inv_scale)))
 
     # Build thumbnail from grayscale frames (max-blend composite)
     grays = [e[1] for e in pending]
@@ -246,7 +257,35 @@ def _build_event(pending, fps):
         'fps':         fps,
         'frames_bgr':  frames_bgr,
         'thumbnail':   thumb,
+        'all_bboxes':  all_bboxes,
     }
+
+
+def generate_glare_mask(events, fw, fh, min_hits=3, dilate_px=60):
+    """
+    Build a binary mask from the bbox heatmap across all events.
+    Zones that fire in >= min_hits events are treated as glare and masked out.
+    Returns uint8 array: 255 = active (kept), 0 = masked (excluded).
+    """
+    heatmap = np.zeros((fh, fw), dtype=np.float32)
+    for ev in events:
+        fired = set()
+        for (x, y, w, h) in ev.get('all_bboxes', []):
+            x1, y1 = max(0, x), max(0, y)
+            x2, y2 = min(fw, x + w), min(fh, y + h)
+            if x2 > x1 and y2 > y1:
+                # Count each spatial cell once per event (not per frame)
+                cell = (x1 // 32, y1 // 32)
+                if cell not in fired:
+                    fired.add(cell)
+                    heatmap[y1:y2, x1:x2] += 1.0
+
+    glare = (heatmap >= min_hits).astype(np.uint8) * 255
+    if dilate_px > 0:
+        k = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (dilate_px * 2 + 1, dilate_px * 2 + 1))
+        glare = cv2.dilate(glare, k)
+    return cv2.bitwise_not(glare)
 
 
 def match_events(events_a, events_b, window=60):
@@ -768,12 +807,18 @@ class StreakerCompareApp:
         self.root.configure(bg=BG)
         self.root.minsize(900, 600)
 
-        self._mkv_path  = tk.StringVar()
-        self._mask_path = tk.StringVar()
+        self._mkv_path   = tk.StringVar()
+        self._mask_path  = tk.StringVar()
+        self._cut_start  = tk.StringVar(value='0')
+        self._cut_dur    = tk.StringVar(value='90')
 
         self._result_q  = queue.Queue()
         self._stop_evt  = threading.Event()
         self._running   = False
+        self._events_a  = []
+        self._events_b  = []
+        self._frame_w   = 0
+        self._frame_h   = 0
 
         self._build_ui()
         self._load_config_defaults()
@@ -817,6 +862,46 @@ class StreakerCompareApp:
                                    relief='flat', padx=12, pady=4,
                                    state='disabled')
         self._stop_btn.pack(side='left', padx=2)
+
+        self._glare_btn = tk.Button(row1, text='🎭 Glare Mask',
+                                    command=self._on_glare_mask,
+                                    bg='#2a1a3a', fg='white',
+                                    font=('Arial', 9, 'bold'),
+                                    relief='flat', padx=10, pady=4,
+                                    state='disabled')
+        self._glare_btn.pack(side='left', padx=8)
+
+        # ── Row 1b: clip trimmer ────────────────────────────────────────
+        row1b = tk.Frame(self.root, bg='#0d0d1a')
+        row1b.pack(fill='x', side='top', padx=4, pady=(0, 2))
+
+        tk.Label(row1b, text='✂ Trim clip:',
+                 bg='#0d0d1a', fg=FG2,
+                 font=('Arial', 8, 'bold')).pack(side='left', padx=(8, 4))
+
+        tk.Label(row1b, text='Start (MM:SS or sec)',
+                 bg='#0d0d1a', fg=FG2, font=('Arial', 7)).pack(side='left')
+        tk.Entry(row1b, textvariable=self._cut_start, width=8,
+                 bg=ENTRY_BG, fg=FG, relief='flat',
+                 insertbackground=FG).pack(side='left', padx=(2, 8))
+
+        tk.Label(row1b, text='Duration (sec)',
+                 bg='#0d0d1a', fg=FG2, font=('Arial', 7)).pack(side='left')
+        tk.Entry(row1b, textvariable=self._cut_dur, width=6,
+                 bg=ENTRY_BG, fg=FG, relief='flat',
+                 insertbackground=FG).pack(side='left', padx=(2, 8))
+
+        self._cut_btn = tk.Button(row1b, text='✂ Cut & Use',
+                                   command=self._on_cut,
+                                   bg='#1a1a3a', fg='white',
+                                   font=('Arial', 8, 'bold'),
+                                   relief='flat', padx=8, pady=2)
+        self._cut_btn.pack(side='left', padx=4)
+
+        self._cut_status = tk.Label(row1b, text='',
+                                    bg='#0d0d1a', fg='#aaaaff',
+                                    font=('Arial', 7))
+        self._cut_status.pack(side='left', padx=8)
 
         # ── Row 2: param panels + copy button ──────────────────────────
         row2 = tk.Frame(self.root, bg=BG)
@@ -978,7 +1063,7 @@ class StreakerCompareApp:
             def progress_b(fi, tot):
                 self._result_q.put(('progress', f'Config B: frame {fi}/{tot}'))
 
-            events_a = run_detection_pass(
+            events_a, fw, fh = run_detection_pass(
                 mkv, mask, params_a,
                 progress_cb=progress_a,
                 stop_event=self._stop_evt)
@@ -989,7 +1074,7 @@ class StreakerCompareApp:
 
             self._result_q.put(('progress', 'Config A done — running Config B …'))
 
-            events_b = run_detection_pass(
+            events_b, fw, fh = run_detection_pass(
                 mkv, mask, params_b,
                 progress_cb=progress_b,
                 stop_event=self._stop_evt)
@@ -999,7 +1084,7 @@ class StreakerCompareApp:
                 return
 
             rows = match_events(events_a, events_b)
-            self._result_q.put(('done', (events_a, events_b, rows)))
+            self._result_q.put(('done', (events_a, events_b, rows, fw, fh)))
 
         except Exception as exc:
             import traceback
@@ -1013,7 +1098,7 @@ class StreakerCompareApp:
                 if msg_type == 'progress':
                     self._status_var.set(payload)
                 elif msg_type == 'done':
-                    self._on_done(*payload)
+                    self._on_done(*payload)  # events_a, events_b, rows, fw, fh
                     return
                 elif msg_type == 'stopped':
                     self._status_var.set('Stopped.')
@@ -1027,7 +1112,12 @@ class StreakerCompareApp:
             pass
         self.root.after(100, self._poll_results)
 
-    def _on_done(self, events_a, events_b, rows):
+    def _on_done(self, events_a, events_b, rows, fw=0, fh=0):
+        self._events_a = events_a
+        self._events_b = events_b
+        self._frame_w  = fw
+        self._frame_h  = fh
+
         n_a    = len(events_a)
         n_b    = len(events_b)
         both   = sum(1 for ea, eb in rows if ea and eb)
@@ -1039,6 +1129,7 @@ class StreakerCompareApp:
             f'    Only A: {only_a}    Only B: {only_b}')
         self._status_var.set('Detection complete.')
         self._grid.populate(rows)
+        self._glare_btn.config(state='normal')
         self._finish_run()
 
     def _finish_run(self):
@@ -1078,6 +1169,202 @@ class StreakerCompareApp:
     # Window close
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Clip trimmer
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_time(s):
+        """Parse 'MM:SS', 'HH:MM:SS', or plain seconds string → float seconds."""
+        s = s.strip()
+        if ':' in s:
+            parts = s.split(':')
+            secs = 0.0
+            for p in parts:
+                secs = secs * 60 + float(p)
+            return secs
+        return float(s)
+
+    def _on_cut(self):
+        src = self._mkv_path.get().strip()
+        if not src or not os.path.exists(src):
+            messagebox.showerror('No source', 'Select a source MKV first.')
+            return
+        try:
+            start_sec = self._parse_time(self._cut_start.get())
+            dur_sec   = float(self._cut_dur.get())
+        except ValueError:
+            messagebox.showerror('Bad value',
+                                 'Start must be MM:SS or seconds; Duration must be a number.')
+            return
+
+        out_dir  = os.path.dirname(src)
+        out_name = (f'_trimmed_{int(start_sec)}s_{int(dur_sec)}s_'
+                    f'{os.path.splitext(os.path.basename(src))[0]}.mkv')
+        out_path = os.path.join(out_dir, out_name)
+
+        self._cut_btn.config(state='disabled', text='Cutting…')
+        self._cut_status.config(text='')
+
+        def _do():
+            try:
+                cmd = [
+                    FFMPEG_PATH, '-y',
+                    '-ss', str(start_sec),
+                    '-i', src,
+                    '-t', str(dur_sec),
+                    '-c', 'copy',
+                    out_path,
+                ]
+                result = subprocess.run(cmd,
+                                        stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.PIPE)
+                if result.returncode == 0 and os.path.exists(out_path):
+                    self.root.after(0, lambda: self._cut_done(out_path))
+                else:
+                    err = result.stderr.decode(errors='replace')[-200:]
+                    self.root.after(0, lambda: self._cut_failed(err))
+            except Exception as e:
+                self.root.after(0, lambda: self._cut_failed(str(e)))
+
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _cut_done(self, out_path):
+        self._mkv_path.set(out_path)
+        self._cut_btn.config(state='normal', text='✂ Cut & Use')
+        self._cut_status.config(
+            text=f'✓ {os.path.basename(out_path)}', fg='#aaffaa')
+
+    def _cut_failed(self, err):
+        self._cut_btn.config(state='normal', text='✂ Cut & Use')
+        self._cut_status.config(text=f'✗ {err[:80]}', fg='#ff8888')
+
+    # ------------------------------------------------------------------
+    # Glare mask generator
+    # ------------------------------------------------------------------
+
+    def _on_glare_mask(self):
+        if not self._events_a and not self._events_b:
+            messagebox.showinfo('No events', 'Run a detection pass first.')
+            return
+        if not self._frame_w or not self._frame_h:
+            messagebox.showerror('No frame size', 'Frame dimensions unknown — re-run detection.')
+            return
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title('Generate Glare Mask')
+        dlg.configure(bg=BG)
+        dlg.resizable(False, False)
+
+        lp = dict(bg=BG, fg=FG2, font=('Arial', 8))
+
+        # Source selection
+        src_var = tk.StringVar(value='both')
+        tk.Label(dlg, text='Events to use:', **lp).grid(row=0, column=0, sticky='w', padx=10, pady=(10,2))
+        for col, (val, txt) in enumerate([('a', 'Config A only'),
+                                           ('b', 'Config B only'),
+                                           ('both', 'Both (union)')]):
+            tk.Radiobutton(dlg, text=txt, variable=src_var, value=val,
+                           bg=BG, fg=FG, selectcolor='#333333',
+                           activebackground=BG, font=('Arial', 8)
+                           ).grid(row=0, column=col+1, padx=4, pady=(10,2))
+
+        # Min hits
+        hits_var = tk.IntVar(value=3)
+        tk.Label(dlg, text='Flag zone if fires in ≥ N events:', **lp).grid(
+            row=1, column=0, columnspan=2, sticky='w', padx=10, pady=2)
+        tk.Scale(dlg, from_=1, to=20, variable=hits_var, orient='horizontal',
+                 bg=BG, fg=FG, troughcolor='#333', highlightthickness=0,
+                 length=200, showvalue=True, font=('Arial', 7)
+                 ).grid(row=1, column=2, columnspan=2, sticky='ew', padx=6)
+
+        # Dilation
+        dil_var = tk.IntVar(value=60)
+        tk.Label(dlg, text='Dilation margin (px):', **lp).grid(
+            row=2, column=0, columnspan=2, sticky='w', padx=10, pady=2)
+        tk.Scale(dlg, from_=0, to=200, variable=dil_var, orient='horizontal',
+                 bg=BG, fg=FG, troughcolor='#333', highlightthickness=0,
+                 length=200, showvalue=True, font=('Arial', 7)
+                 ).grid(row=2, column=2, columnspan=2, sticky='ew', padx=6)
+
+        # Preview canvas
+        prev_lbl = tk.Label(dlg, bg='#080808')
+        prev_lbl.grid(row=3, column=0, columnspan=4, padx=10, pady=8)
+        prev_photo = [None]
+
+        # Combine with existing mask option
+        existing_mask_path = self._mask_path.get().strip()
+        combine_var = tk.BooleanVar(value=bool(existing_mask_path and os.path.exists(existing_mask_path)))
+        combine_cb = tk.Checkbutton(
+            dlg, text=f'AND with existing mask ({os.path.basename(existing_mask_path) or "none"})',
+            variable=combine_var,
+            state='normal' if (existing_mask_path and os.path.exists(existing_mask_path)) else 'disabled',
+            bg=BG, fg=FG2, selectcolor='#333333',
+            activebackground=BG, font=('Arial', 8))
+        combine_cb.grid(row=3, column=0, columnspan=4, sticky='w', padx=10, pady=(0, 4))
+
+        def _preview():
+            src = src_var.get()
+            evs = []
+            if src in ('a', 'both'):
+                evs += self._events_a
+            if src in ('b', 'both'):
+                evs += self._events_b
+            mask = generate_glare_mask(
+                evs, self._frame_w, self._frame_h,
+                min_hits=hits_var.get(), dilate_px=dil_var.get())
+
+            # AND with existing mask if requested
+            if combine_var.get() and existing_mask_path and os.path.exists(existing_mask_path):
+                existing = cv2.imread(existing_mask_path, cv2.IMREAD_GRAYSCALE)
+                if existing is not None:
+                    if existing.shape != mask.shape:
+                        existing = cv2.resize(existing, (self._frame_w, self._frame_h),
+                                              interpolation=cv2.INTER_NEAREST)
+                    mask = cv2.bitwise_and(mask, existing)
+
+            # Scale preview to fit ~600px wide
+            ph = int(600 * self._frame_h / max(self._frame_w, 1))
+            preview = cv2.resize(mask, (600, ph), interpolation=cv2.INTER_AREA)
+            # Colorize: masked=red tint, active=dark
+            rgb = cv2.cvtColor(preview, cv2.COLOR_GRAY2RGB)
+            rgb[preview == 0] = [80, 20, 20]
+            img = ImageTk.PhotoImage(Image.fromarray(rgb))
+            prev_photo[0] = img
+            prev_lbl.config(image=img, width=600, height=ph)
+            dlg._mask_cache = mask
+
+        tk.Button(dlg, text='Preview', command=_preview,
+                  bg='#2a2a3a', fg=FG, relief='flat', padx=8
+                  ).grid(row=4, column=0, columnspan=2, pady=4, padx=10, sticky='ew')
+
+        def _save_apply():
+            if not hasattr(dlg, '_mask_cache'):
+                _preview()
+            src = self._mkv_path.get().strip()
+            init = os.path.dirname(src) if src else os.path.dirname(__file__)
+            out = filedialog.asksaveasfilename(
+                title='Save glare mask',
+                initialdir=init,
+                defaultextension='.png',
+                filetypes=[('PNG', '*.png')])
+            if not out:
+                return
+            cv2.imwrite(out, dlg._mask_cache)
+            self._mask_path.set(out)
+            dlg.destroy()
+
+        tk.Button(dlg, text='Save & Apply as Mask', command=_save_apply,
+                  bg='#1a3a1a', fg='white', relief='flat', padx=8,
+                  font=('Arial', 9, 'bold')
+                  ).grid(row=4, column=2, columnspan=2, pady=4, padx=10, sticky='ew')
+
+        _preview()  # auto-preview on open
+
+    # ------------------------------------------------------------------
+    # Window close
+    # ------------------------------------------------------------------
+
     def _on_close(self):
         self._stop_evt.set()
         self.root.destroy()
@@ -1095,9 +1382,15 @@ class StreakerCompareApp:
 if __name__ == '__main__':
     import argparse
     ap = argparse.ArgumentParser(add_help=False)
-    ap.add_argument('--source', default='')
+    ap.add_argument('--source',   default='')
+    ap.add_argument('--start',    default='')
+    ap.add_argument('--duration', default='')
     args, _ = ap.parse_known_args()
     app = StreakerCompareApp()
     if args.source and os.path.exists(args.source):
         app._mkv_path.set(args.source)
+    if args.start:
+        app._cut_start.set(args.start)
+    if args.duration:
+        app._cut_dur.set(args.duration)
     app.run()

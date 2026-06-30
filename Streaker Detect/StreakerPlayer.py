@@ -12,7 +12,7 @@ import numpy as np
 import cv2
 import re
 
-from platform_utils import FFMPEG_PATH, HWACCEL_ARGS, find_ffprobe
+from platform_utils import FFMPEG_PATH, HWACCEL_ARGS, find_ffprobe, PYTHON_EXE, find_companion_script, NO_WINDOW
 BG       = '#1a1a1a'
 BG2      = '#111111'
 FG       = '#cccccc'
@@ -29,6 +29,17 @@ LABEL_COLORS = {
 }
 
 LABELS = ['unreviewed', 'interesting', 'junk', 'meteor', 'plane', 'satellite', 'unknown']
+
+# Map identification.json classifications → player label names
+_IDENT_TO_LABEL = {
+    'meteor':                 'meteor',
+    'aircraft':               'plane',
+    'satellite':              'satellite',
+    'noise':                  'junk',
+    'unidentified':           'unknown',
+    'unidentified satellite?':'satellite',
+    'unidentified aircraft?': 'plane',
+}
 
 
 def ffprobe_info(ffmpeg_path, video_path):
@@ -74,18 +85,21 @@ class FrameReader:
         self._proc       = None
         self.current_frame = 0
 
+    def _launch_ffmpeg(self, frame_num, hw=True):
+        """Start ffmpeg subprocess; hw=False forces software decode."""
+        ss = frame_num / self.fps
+        cmd = [self.ffmpeg_path]
+        if hw:
+            cmd += HWACCEL_ARGS
+        cmd += ['-ss', f'{ss:.4f}', '-i', self.video_path,
+                '-f', 'rawvideo', '-pix_fmt', 'bgr24', '-an', 'pipe:1']
+        return subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL)
+
     def seek(self, frame_num):
         self.close()
         self.current_frame = max(0, frame_num)
-        ss = self.current_frame / self.fps
-        self._proc = subprocess.Popen([
-            self.ffmpeg_path,
-            *HWACCEL_ARGS,
-            '-ss', f'{ss:.4f}',
-            '-i', self.video_path,
-            '-f', 'rawvideo', '-pix_fmt', 'bgr24',
-            '-an', 'pipe:1'],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        self._proc = self._launch_ffmpeg(self.current_frame, hw=True)
 
     def read(self):
         if not self._proc:
@@ -93,7 +107,19 @@ class FrameReader:
         nbytes = self.width * self.height * 3
         raw = self._proc.stdout.read(nbytes)
         if len(raw) < nbytes:
-            return None
+            # CUDA failed — retry with software decode
+            try:
+                self._proc.stdout.close()
+                self._proc.kill(); self._proc.wait()
+            except Exception:
+                pass
+            self._proc = self._launch_ffmpeg(self.current_frame, hw=False)
+            raw = self._proc.stdout.read(nbytes)
+            if len(raw) < nbytes:
+                self._proc = None
+                return None
+        self.current_frame += 1
+        return np.frombuffer(raw, dtype=np.uint8).reshape(self.height, self.width, 3)
         self.current_frame += 1
         return np.frombuffer(raw, dtype=np.uint8).reshape(self.height, self.width, 3)
 
@@ -112,19 +138,21 @@ class StreakerPlayer:
     TIMELINE_H   = 60
     CTRL_H       = 40
 
-    def __init__(self, root, initial_folder=None):
+    def __init__(self, root, initial_folder=None, initial_mkv=None):
         self.root = root
         self.root.title("Streaker Player")
         self.root.geometry("1200x820")
         self.root.configure(bg=BG)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
+        self._initial_mkv = initial_mkv
         self.run_folder   = None
         self.events       = []       # all loaded events (dicts)
         self.clip_events  = {}       # clip_path -> [event, ...]
         self.clip_list    = []       # ordered list of unique clip paths
-        self.annotations  = {}       # event_dir -> label string
-        self.annot_path   = None
+        self.annotations     = {}    # event_dir -> label string (manual)
+        self.identifications = {}    # event_dir -> identification.json dict
+        self.annot_path      = None
 
         self.current_clip_idx = 0
         self.reader       = None
@@ -138,6 +166,10 @@ class StreakerPlayer:
         self._play_id     = None
         self.play_speed   = 1.0      # multiplier
         self.current_event_idx = -1  # index into self.events for current clip
+        self._displayed_events = []  # events currently shown in listbox (may be filtered/sorted)
+        self._sort_mode = tk.StringVar(value='time')
+        self._last_raw_frame  = None  # full-res BGR frame for grab/export
+        self._last_stack_path = None  # path to most recent stack_mean.png
 
         self.tk_image     = None
         self._frame_q     = queue.Queue(maxsize=4)
@@ -148,6 +180,8 @@ class StreakerPlayer:
 
         if initial_folder and os.path.isdir(initial_folder):
             self.root.after(100, lambda: self.load_run_folder(initial_folder))
+        elif getattr(self, '_initial_mkv', None):
+            self.root.after(100, lambda: self._open_direct_mkv(self._initial_mkv))
 
     # ------------------------------------------------------------------
     # UI Construction
@@ -168,6 +202,20 @@ class StreakerPlayer:
         tk.Button(top, text="🎬 Open MKV",
                   command=self._browse_mkv,
                   bg='#334455', fg='white', relief='flat',
+                  padx=8, pady=2).pack(side='left', padx=4)
+
+        tk.Label(top, text="│", bg=BG, fg='#444').pack(side='left', padx=2)
+        tk.Button(top, text="📷 Grab Frame",
+                  command=self._grab_frame,
+                  bg='#334433', fg='white', relief='flat',
+                  padx=8, pady=2).pack(side='left', padx=4)
+        tk.Button(top, text="📷×N Stack Grab",
+                  command=self._grab_series,
+                  bg='#334433', fg='white', relief='flat',
+                  padx=8, pady=2).pack(side='left', padx=4)
+        tk.Button(top, text="🔭 Solve & Measure",
+                  command=self._launch_astro,
+                  bg='#1a3a5a', fg='white', relief='flat',
                   padx=8, pady=2).pack(side='left', padx=4)
 
         self.folder_lbl = tk.Label(top, text="No folder loaded",
@@ -222,6 +270,18 @@ class StreakerPlayer:
                   command=self._save_annotations,
                   bg='#224422', fg='white', relief='flat',
                   font=('Arial', 7), pady=3).pack(fill='x', pady=(6, 2))
+
+        # Sort / filter controls
+        sort_row = tk.Frame(ep, bg=BG2)
+        sort_row.pack(fill='x', padx=4, pady=(2, 0))
+        tk.Label(sort_row, text='Sort:', bg=BG2, fg='#666666',
+                 font=('Arial', 7)).pack(side='left', padx=(0, 3))
+        sort_cb = ttk.Combobox(sort_row, textvariable=self._sort_mode,
+                               values=['time', 'flagged_first', 'flagged_only'],
+                               state='readonly', width=13,
+                               font=('Arial', 7))
+        sort_cb.pack(side='left')
+        sort_cb.bind('<<ComboboxSelected>>', lambda _e: self._on_sort_change())
 
         # Scrollable event list
         lf = tk.Frame(ep, bg=BG2)
@@ -330,10 +390,40 @@ class StreakerPlayer:
         self.root.bind('<space>', lambda e: self._toggle_play())
         self.root.bind('<comma>',  lambda e: self._prev_event())   # < key
         self.root.bind('<period>', lambda e: self._next_event())   # > key
+        self.root.bind('<p>', lambda e: self._grab_frame())
+        self.root.bind('<P>', lambda e: self._grab_series())
 
     # ------------------------------------------------------------------
     # Loading
     # ------------------------------------------------------------------
+
+    def _open_direct_mkv(self, mkv_path):
+        """Load a single MKV directly — mirrors _browse_mkv without the dialog."""
+        try:
+            self._stop_playback()
+            fps, total, w, h = ffprobe_info(FFMPEG_PATH, mkv_path)
+            self.fps, self.total_frames = fps, total
+            self.frame_w, self.frame_h  = w, h
+            self.clip_list    = [mkv_path]
+            self.clip_events  = {mkv_path: []}
+            self.events       = []
+            self.current_clip_idx  = 0
+            self.current_event_idx = -1
+            if self.reader:
+                self.reader.close()
+            self.reader = FrameReader(FFMPEG_PATH, mkv_path, w, h, fps)
+            self.reader.seek(0)
+            name = os.path.basename(mkv_path)
+            self.folder_lbl.config(text=name)
+            self.clip_lbl.config(text=name)
+            self.event_listbox.delete(0, 'end')
+            self.event_count_lbl.config(text="0 events (direct clip)")
+            self._draw_timeline()
+            self._seek_and_show(0)
+        except Exception as exc:
+            import traceback
+            messagebox.showerror("Player Error",
+                                 f"Failed to open:\n{mkv_path}\n\n{traceback.format_exc()}")
 
     def load_run_folder(self, folder):
         self.run_folder = folder
@@ -348,9 +438,11 @@ class StreakerPlayer:
 
         self.events = []
         self.clip_events = {}
+        self.identifications = {}
 
         for d in sorted(os.listdir(folder)):
-            meta_path = os.path.join(folder, d, 'metadata.json')
+            meta_path  = os.path.join(folder, d, 'metadata.json')
+            ident_path = os.path.join(folder, d, 'identification.json')
             if not os.path.exists(meta_path):
                 continue
             try:
@@ -358,6 +450,12 @@ class StreakerPlayer:
                     meta = json.load(f)
             except Exception:
                 continue
+            if os.path.exists(ident_path):
+                try:
+                    with open(ident_path) as f:
+                        self.identifications[os.path.join(folder, d)] = json.load(f)
+                except Exception:
+                    pass
 
             clip = meta.get('source_clip', '')
             if not clip or not os.path.exists(clip):
@@ -390,6 +488,20 @@ class StreakerPlayer:
             self.current_clip_idx = 0
             self._load_clip(self.clip_list[0])
 
+    def _display_label(self, ev_dir):
+        """Return (label, color, is_auto, flagged) for an event.
+        Manual annotation takes priority; falls back to identification.json."""
+        manual = self.annotations.get(ev_dir)
+        if manual:
+            return manual, LABEL_COLORS.get(manual, LABEL_COLORS['unreviewed']), False, False
+        ident = self.identifications.get(ev_dir)
+        if ident:
+            cls   = ident.get('classification', '')
+            label = _IDENT_TO_LABEL.get(cls, 'unknown')
+            color = LABEL_COLORS.get(label, LABEL_COLORS['unreviewed'])
+            return label, color, True, ident.get('flagged', False)
+        return 'unreviewed', LABEL_COLORS['unreviewed'], False, False
+
     def _load_clip(self, clip_path):
         self._stop_playback()
         if self.reader:
@@ -406,17 +518,7 @@ class StreakerPlayer:
         self.clip_lbl.config(text=f"[{idx}/{total}] {name}")
 
         # Populate event list
-        self.event_listbox.delete(0, 'end')
-        clip_evs = self.clip_events.get(clip_path, [])
-        for ev in clip_evs:
-            mm = int(ev['start_sec']) // 60
-            ss = int(ev['start_sec']) % 60
-            label = self.annotations.get(ev['dir'], 'unreviewed')
-            color = LABEL_COLORS.get(label, LABEL_COLORS['unreviewed'])
-            dur = ev['end_sec'] - ev['start_sec']
-            self.event_listbox.insert('end',
-                f"  {mm:02d}:{ss:02d}  {dur:4.1f}s  {label[:10]}")
-            self.event_listbox.itemconfig('end', fg=color)
+        self._refresh_event_list(clip_path)
 
         self.current_frame_num = 0
         self.current_event_idx = -1
@@ -466,6 +568,7 @@ class StreakerPlayer:
             self.reader.seek(self.current_frame_num)
             frame = self.reader.read()
             if frame is not None:
+                self._last_raw_frame = frame
                 self._display_frame(frame)
         self._draw_timeline()
         self._update_time_label()
@@ -494,9 +597,7 @@ class StreakerPlayer:
             return
         for ev in self.clip_events.get(clip, []):
             if ev['start_frame'] <= self.current_frame_num <= ev['end_frame']:
-                label = self.annotations.get(ev['dir'], 'unreviewed')
-                color = LABEL_COLORS.get(label, LABEL_COLORS['unreviewed'])
-                # Draw bboxes for this frame
+                label, color, is_auto, flagged = self._display_label(ev['dir'])
                 for det in ev['detections']:
                     if det['frame'] == self.current_frame_num and det.get('bboxes'):
                         for bx, by, bw, bh in det['bboxes']:
@@ -506,9 +607,11 @@ class StreakerPlayer:
                             y2 = y1 + int(bh * scale)
                             self.canvas.create_rectangle(
                                 x1, y1, x2, y2, outline=color, width=2)
-                name = ev['name']
+                prefix = '~' if is_auto else ''
+                flag   = '  ⚑' if flagged else ''
                 self.canvas.create_text(
-                    10, 10, anchor='nw', text=f"EVENT: {name}  [{label}]",
+                    10, 10, anchor='nw',
+                    text=f"EVENT: {ev['name']}  [{prefix}{label}]{flag}",
                     fill=color, font=('Courier', 9, 'bold'))
                 break
 
@@ -551,6 +654,7 @@ class StreakerPlayer:
             self._stop_playback()
             return
         self.current_frame_num = self.reader.current_frame
+        self._last_raw_frame = frame
         self._display_frame(frame)
         self._draw_timeline()
         self._update_time_label()
@@ -657,11 +761,12 @@ class StreakerPlayer:
 
         # Draw event markers
         for ev in self.clip_events.get(clip, []):
-            label = self.annotations.get(ev['dir'], 'unreviewed')
-            color = LABEL_COLORS.get(label, LABEL_COLORS['unreviewed'])
+            label, color, is_auto, flagged = self._display_label(ev['dir'])
             x1 = int(ev['start_frame'] / total * w)
             x2 = max(x1 + 2, int(ev['end_frame'] / total * w))
             tl.create_rectangle(x1, 4, x2, h - 4, fill=color, outline='')
+            if flagged:
+                tl.create_rectangle(x1, 4, x1 + 3, h - 4, fill='#ffdd00', outline='')
 
         # Current position cursor
         cx = int(self.current_frame_num / total * w)
@@ -694,13 +799,9 @@ class StreakerPlayer:
         sel = self.event_listbox.curselection()
         if not sel:
             return
-        clip = self.clip_list[self.current_clip_idx] if self.clip_list else None
-        if not clip:
-            return
-        evs = self.clip_events.get(clip, [])
         idx = sel[0]
-        if idx < len(evs):
-            ev = evs[idx]
+        if idx < len(self._displayed_events):
+            ev = self._displayed_events[idx]
             self.current_event_idx = idx
             self._stop_playback()
             self._seek_and_show(max(0, ev['start_frame'] - 20))
@@ -727,16 +828,36 @@ class StreakerPlayer:
             self._draw_timeline()
 
     def _refresh_event_list(self, clip):
+        clip_evs = self.clip_events.get(clip, [])
+        mode = self._sort_mode.get()
+
+        if mode == 'flagged_only':
+            evs = [ev for ev in clip_evs
+                   if self._display_label(ev['dir'])[3]]
+        elif mode == 'flagged_first':
+            flagged = [ev for ev in clip_evs if self._display_label(ev['dir'])[3]]
+            rest    = [ev for ev in clip_evs if not self._display_label(ev['dir'])[3]]
+            evs = flagged + rest
+        else:
+            evs = list(clip_evs)
+
+        self._displayed_events = evs
         self.event_listbox.delete(0, 'end')
-        for ev in self.clip_events.get(clip, []):
+        for ev in evs:
             mm = int(ev['start_sec']) // 60
             ss = int(ev['start_sec']) % 60
-            label = self.annotations.get(ev['dir'], 'unreviewed')
-            color = LABEL_COLORS.get(label, LABEL_COLORS['unreviewed'])
+            label, color, is_auto, flagged = self._display_label(ev['dir'])
             dur = ev['end_sec'] - ev['start_sec']
+            prefix = '~' if is_auto else ' '
+            flag   = ' ⚑' if flagged else ''
             self.event_listbox.insert('end',
-                f"  {mm:02d}:{ss:02d}  {dur:4.1f}s  {label[:10]}")
+                f"  {mm:02d}:{ss:02d}  {dur:4.1f}s  {prefix}{label[:9]}{flag}")
             self.event_listbox.itemconfig('end', fg=color)
+
+    def _on_sort_change(self):
+        clip = self.clip_list[self.current_clip_idx] if self.clip_list else None
+        if clip:
+            self._refresh_event_list(clip)
 
     def _save_annotations(self):
         if not self.annot_path:
@@ -748,6 +869,163 @@ class StreakerPlayer:
                 f"Annotations saved to:\n{self.annot_path}")
         except Exception as e:
             messagebox.showerror("Error", str(e))
+
+    # ------------------------------------------------------------------
+    # Frame grab / astrometry export
+    # ------------------------------------------------------------------
+
+    def _grab_dir(self):
+        if not self.clip_list:
+            return None
+        clip = self.clip_list[self.current_clip_idx]
+        d = os.path.join(os.path.dirname(clip), 'astrometry_grabs')
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def _grab_frame(self):
+        if self._last_raw_frame is None:
+            return
+        d = self._grab_dir()
+        if not d:
+            return
+        fname = f"frame_{self.current_frame_num:06d}.png"
+        cv2.imwrite(os.path.join(d, fname), self._last_raw_frame)
+        self.status_lbl.config(text=f"Saved: {fname}")
+
+    def _grab_series(self):
+        if not self.clip_list:
+            return
+
+        # Dialog: frame count + stack mode
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Stack Grab")
+        dlg.configure(bg='#1a1a1a')
+        dlg.resizable(False, False)
+        dlg.grab_set()
+
+        tk.Label(dlg, text="Frames to grab:", bg='#1a1a1a', fg='#cccccc',
+                 font=('Arial', 9)).grid(row=0, column=0, padx=12, pady=8, sticky='w')
+        count_var = tk.IntVar(value=20)
+        tk.Spinbox(dlg, from_=1, to=200, textvariable=count_var, width=6,
+                   bg='#2a2a2a', fg='white', insertbackground='white',
+                   buttonbackground='#333').grid(row=0, column=1, padx=8, pady=8, sticky='w')
+
+        tk.Label(dlg, text="Stack mode:", bg='#1a1a1a', fg='#cccccc',
+                 font=('Arial', 9)).grid(row=1, column=0, padx=12, pady=4, sticky='w')
+        mode_var = tk.StringVar(value='max')
+        tk.Radiobutton(dlg, text="Max — brightest pixel (stars pop)",
+                       variable=mode_var, value='max',
+                       bg='#1a1a1a', fg='#cccccc', selectcolor='#333',
+                       activebackground='#1a1a1a', activeforeground='white',
+                       font=('Arial', 9)).grid(row=1, column=1, padx=8, sticky='w')
+        tk.Radiobutton(dlg, text="Mean — noise reduction",
+                       variable=mode_var, value='mean',
+                       bg='#1a1a1a', fg='#cccccc', selectcolor='#333',
+                       activebackground='#1a1a1a', activeforeground='white',
+                       font=('Arial', 9)).grid(row=2, column=1, padx=8, sticky='w')
+
+        confirmed = [False]
+        def on_ok():
+            confirmed[0] = True
+            dlg.destroy()
+        def on_cancel():
+            dlg.destroy()
+
+        btn_row = tk.Frame(dlg, bg='#1a1a1a')
+        btn_row.grid(row=3, column=0, columnspan=2, pady=10)
+        tk.Button(btn_row, text="Grab", command=on_ok,
+                  bg='#334433', fg='white', relief='flat', padx=12).pack(side='left', padx=6)
+        tk.Button(btn_row, text="Cancel", command=on_cancel,
+                  bg='#333333', fg='white', relief='flat', padx=12).pack(side='left', padx=6)
+
+        dlg.bind('<Return>', lambda e: on_ok())
+        dlg.bind('<Escape>', lambda e: on_cancel())
+        self.root.wait_window(dlg)
+
+        if not confirmed[0]:
+            return
+
+        count = count_var.get()
+        mode  = mode_var.get()
+
+        d = self._grab_dir()
+        clip = self.clip_list[self.current_clip_idx]
+        subfolder = os.path.join(d, f"stack_{self.current_frame_num:06d}_{count}f")
+        os.makedirs(subfolder, exist_ok=True)
+
+        self._stop_playback()
+        temp = FrameReader(FFMPEG_PATH, clip, self.frame_w, self.frame_h, self.fps)
+        temp.seek(self.current_frame_num)
+        saved = 0
+        for i in range(count):
+            frame = temp.read()
+            if frame is None:
+                break
+            cv2.imwrite(os.path.join(subfolder, f"frame_{i:04d}.png"), frame)
+            saved += 1
+            self.status_lbl.config(text=f"Grabbing… {saved}/{count}")
+            self.root.update_idletasks()
+        temp.close()
+
+        # Stack frames
+        stack_img = None
+        for i in range(saved):
+            img = cv2.imread(os.path.join(subfolder, f"frame_{i:04d}.png"))
+            if img is not None:
+                arr = img.astype(np.float32)
+                if stack_img is None:
+                    stack_img = arr
+                elif mode == 'max':
+                    stack_img = np.maximum(stack_img, arr)
+                else:
+                    stack_img = stack_img + arr
+
+        if stack_img is not None:
+            if mode == 'mean':
+                stack_img = stack_img / saved
+            result = stack_img.clip(0, 255).astype(np.uint8)
+            fname = f"stack_{mode}.png"
+            self._last_stack_path = os.path.join(subfolder, fname)
+            cv2.imwrite(self._last_stack_path, result)
+            self.status_lbl.config(
+                text=f"Grabbed {saved} frames + {mode} stacked → {os.path.basename(subfolder)}/")
+            messagebox.showinfo("Stack Grab Done",
+                                f"Saved {saved} frames and {fname} to:\n{subfolder}")
+        else:
+            self.status_lbl.config(text=f"Saved {saved} frames → {os.path.basename(subfolder)}/")
+            messagebox.showinfo("Stack Grab Done",
+                                f"Saved {saved} frames to:\n{subfolder}")
+
+    # ------------------------------------------------------------------
+    # Astrometry launch
+    # ------------------------------------------------------------------
+
+    def _current_event(self):
+        clip = self.clip_list[self.current_clip_idx] if self.clip_list else None
+        if not clip:
+            return None
+        evs = self.clip_events.get(clip, [])
+        for ev in evs:
+            if ev['start_frame'] <= self.current_frame_num <= ev['end_frame']:
+                return ev
+        if evs:
+            return min(evs, key=lambda e: abs(e['start_frame'] - self.current_frame_num))
+        return None
+
+    def _launch_astro(self):
+        script = find_companion_script('StreakerAstro.py')
+        args = [PYTHON_EXE, script]
+        if self._last_stack_path and os.path.exists(self._last_stack_path):
+            args += ['--stack', self._last_stack_path]
+        ev = self._current_event()
+        if ev:
+            args += ['--event', ev['dir']]
+        elif self.clip_list:
+            # direct-MKV mode: event folder is the clip's parent directory
+            clip_dir = os.path.dirname(self.clip_list[self.current_clip_idx])
+            if os.path.isfile(os.path.join(clip_dir, 'metadata.json')):
+                args += ['--event', clip_dir]
+        subprocess.Popen(args, creationflags=NO_WINDOW)
 
     # ------------------------------------------------------------------
     # Cleanup
@@ -762,9 +1040,9 @@ class StreakerPlayer:
 
 # ── Launch from StreakerDetect or standalone ──────────────────────────
 
-def launch_player(initial_folder=None):
+def launch_player(initial_folder=None, mkv_path=None):
     root = tk.Toplevel() if tk._default_root else tk.Tk()
-    app = StreakerPlayer(root, initial_folder=initial_folder)
+    app = StreakerPlayer(root, initial_folder=initial_folder, initial_mkv=mkv_path)
     if not tk._default_root or tk._default_root is root:
         root.mainloop()
 

@@ -1,0 +1,18 @@
+{
+  "cameras": [
+    {
+      "label": "CAM1",
+      "rtsp_url": "rtsp://user:password@192.168.x.x:554/cam/realmonitor?channel=1&subtype=0",
+      "substream_url": "",
+      "use_substream": false
+    },
+    {
+      "label": "CAM2",
+      "rtsp_url": "rtsp://user:password@192.168.x.x:554/cam/realmonitor?channel=1&subtype=0",
+      "substream_url": "",
+      "use_substream": false
+    }
+  ],
+  "window_width": 960,
+  "window_height": 1080
+}

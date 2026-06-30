@@ -81,7 +81,7 @@ class StreamCapture:
     def __init__(self, root):
         self.root = root
         self.root.title("Stream Capture - Twilight Timing")
-        self.output_dir = StringVar(value=os.path.join(os.path.expanduser("~"), "Dahua_MKV_Streaker"))
+        self.output_dir = StringVar(value=os.path.join(os.path.expanduser("~"), "Streaker_MKV"))
         self.rtsp_url = StringVar()
         self.chunk_minutes = IntVar(value=15)
         self.start_time = StringVar()
@@ -92,9 +92,11 @@ class StreamCapture:
         self.mode_label = StringVar(value="Mode: Not Started")
         self.stop_offset_label = StringVar(value="Stop Offset: 0 min")
         self.start_offset_label = StringVar(value="Start Offset: 0 min")
-        self.session_start_date = datetime.now(timezone.utc).strftime("%m-%d-%Y")
+        self.session_start_date = ""
         self.stop_time_offset = IntVar(value=0)
         self.start_time_offset = IntVar(value=0)
+        self.camera_id = StringVar(value="CAM1")
+        self.camera_serial = StringVar(value="")
         self.load_config()
         self.recording_thread = None
         self.stop_event = Event()
@@ -154,10 +156,34 @@ class StreamCapture:
     reset_offset = reset_stop_offset
 
     def _start_recording(self, start_dt, end_dt):
+        session_date = start_dt.strftime("%m-%d-%Y")
         def record():
+            if os.name == 'nt':
+                import ctypes
+                ctypes.windll.kernel32.SetThreadExecutionState(0x80000003)  # ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED
+            self.session_start_date = session_date
             self.timer_label.set("Recording...")
             chunk_seconds = self.chunk_minutes.get() * 60
             actual_start_time = datetime.now(timezone.utc)
+
+            output_folder = self.create_date_folder(self.output_dir.get())
+            manifest = {
+                "camera_id": self.camera_id.get().strip(),
+                "serial": self.camera_serial.get().strip(),
+                "utc_session_start": start_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "utc_session_end_scheduled": end_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "gps": {"lat": self.latitude.get(), "lon": self.longitude.get()},
+                "rtsp_url": self.rtsp_url.get().strip(),
+                "session_date_folder": session_date
+            }
+            manifest_path = os.path.join(output_folder, "session_info.json")
+            try:
+                with open(manifest_path, "w", encoding="utf-8") as f:
+                    json.dump(manifest, f, indent=4)
+                print(f"[INFO] Session manifest written: {manifest_path}")
+            except Exception as e:
+                print(f"[ERROR] Failed to write session manifest: {e}")
+
             print(f"[DEBUG] Scheduled recording from {start_dt} to {end_dt} ({(end_dt - start_dt).total_seconds()} seconds)")
             print("[DEBUG] Entering recording loop")
             while True:
@@ -181,14 +207,17 @@ class StreamCapture:
                 self.recording_process = subprocess.Popen(
                     cmd,
                     creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
                 )
-                stdout, stderr = self.recording_process.communicate()
+                self.recording_process.wait()
                 print(f"[DEBUG] ffmpeg exited with code {self.recording_process.returncode}")
                 if self.recording_process.returncode not in (0, 1):
-                    print(f"[ERROR] ffmpeg failed (code {self.recording_process.returncode}): {stderr.decode(errors='ignore').strip()}")
+                    print(f"[ERROR] ffmpeg failed (code {self.recording_process.returncode})")
 
+            if os.name == 'nt':
+                import ctypes
+                ctypes.windll.kernel32.SetThreadExecutionState(0x80000000)  # ES_CONTINUOUS — release keep-awake
             self.timer_label.set("Recording Complete")
 
         self.stop_event.clear()
@@ -208,41 +237,51 @@ class StreamCapture:
         Entry(self.root, textvariable=self.output_dir, width=50).grid(row=1, column=1)
         Button(self.root, text="Browse", command=self.select_output_directory).grid(row=1, column=2)
 
-        Label(self.root, text="Latitude:").grid(row=2, column=0, sticky="e")
+        Label(self.root, text="Camera ID:").grid(row=2, column=0, sticky="e")
+        cam_id_entry = Entry(self.root, textvariable=self.camera_id, width=20)
+        cam_id_entry.grid(row=2, column=1, sticky="w")
+        cam_id_entry.bind("<FocusOut>", lambda e: self.save_config())
+        cam_id_entry.bind("<Return>", lambda e: self.save_config())
+
+        Label(self.root, text="Camera Serial:").grid(row=3, column=0, sticky="e")
+        serial_entry = Entry(self.root, textvariable=self.camera_serial, width=30)
+        serial_entry.grid(row=3, column=1, sticky="w")
+        serial_entry.bind("<FocusOut>", lambda e: self.save_config())
+        serial_entry.bind("<Return>", lambda e: self.save_config())
+
+        Label(self.root, text="Latitude:").grid(row=4, column=0, sticky="e")
         lat_entry = Entry(self.root, textvariable=self.latitude)
-        lat_entry.grid(row=2, column=1)
+        lat_entry.grid(row=4, column=1)
         lat_entry.bind("<FocusOut>", lambda e: self.on_gps_change())
         lat_entry.bind("<Return>", lambda e: self.on_gps_change())
 
-        Label(self.root, text="Longitude:").grid(row=3, column=0, sticky="e")
+        Label(self.root, text="Longitude:").grid(row=5, column=0, sticky="e")
         lon_entry = Entry(self.root, textvariable=self.longitude)
-        lon_entry.grid(row=3, column=1)
+        lon_entry.grid(row=5, column=1)
         lon_entry.bind("<FocusOut>", lambda e: self.on_gps_change())
         lon_entry.bind("<Return>", lambda e: self.on_gps_change())
 
-        Label(self.root, text="UTC Start Time (HH:MM):").grid(row=4, column=0, sticky="e")
-        Entry(self.root, textvariable=self.start_time).grid(row=4, column=1)
-        Button(self.root, text="+1 min", command=self.increment_start_offset).grid(row=4, column=2)
-        Button(self.root, text="-1 min", command=self.decrement_start_offset).grid(row=4, column=3)
-        Button(self.root, text="Reset Offset", command=self.reset_start_offset).grid(row=4, column=4)
+        Label(self.root, text="UTC Start Time (HH:MM):").grid(row=6, column=0, sticky="e")
+        Entry(self.root, textvariable=self.start_time).grid(row=6, column=1)
+        Button(self.root, text="+1 min", command=self.increment_start_offset).grid(row=6, column=2)
+        Button(self.root, text="-1 min", command=self.decrement_start_offset).grid(row=6, column=3)
+        Button(self.root, text="Reset Offset", command=self.reset_start_offset).grid(row=6, column=4)
 
+        Label(self.root, text="End Time (HH:MM):").grid(row=7, column=0, sticky="e")
+        Entry(self.root, textvariable=self.end_time).grid(row=7, column=1)
+        Button(self.root, text="+1 min", command=self.increment_offset).grid(row=7, column=2)
+        Button(self.root, text="-1 min", command=self.decrement_offset).grid(row=7, column=3)
+        Button(self.root, text="Reset Offset", command=self.reset_offset).grid(row=7, column=4)
 
-        Label(self.root, text="End Time (HH:MM):").grid(row=5, column=0, sticky="e")
-        Entry(self.root, textvariable=self.end_time).grid(row=5, column=1)
-        Button(self.root, text="+1 min", command=self.increment_offset).grid(row=5, column=2)
-        Button(self.root, text="-1 min", command=self.decrement_offset).grid(row=5, column=3)
-        Button(self.root, text="Reset Offset", command=self.reset_offset).grid(row=5, column=4)
+        Label(self.root, textvariable=self.start_offset_label).grid(row=8, column=0)
+        Label(self.root, textvariable=self.stop_offset_label).grid(row=8, column=1)
 
-        Label(self.root, textvariable=self.start_offset_label).grid(row=6, column=0)
-        Label(self.root, textvariable=self.stop_offset_label).grid(row=6, column=1)
+        Label(self.root, textvariable=self.timer_label, font=("Arial", 14), fg="red").grid(row=9, column=0, columnspan=3)
+        Label(self.root, textvariable=self.mode_label, font=("Arial", 10), fg="blue").grid(row=10, column=0, columnspan=3)
 
-
-        Label(self.root, textvariable=self.timer_label, font=("Arial", 14), fg="red").grid(row=7, column=0, columnspan=3)
-        Label(self.root, textvariable=self.mode_label, font=("Arial", 10), fg="blue").grid(row=8, column=0, columnspan=3)
-
-        Button(self.root, text="Start Now", command=self.start_now).grid(row=9, column=0)
-        Button(self.root, text="Start with Delay", command=self.start_with_delay).grid(row=9, column=1)
-        Button(self.root, text="Force Stop", command=self.force_stop_capture).grid(row=9, column=2)
+        Button(self.root, text="Start Now", command=self.start_now).grid(row=11, column=0)
+        Button(self.root, text="Start with Delay", command=self.start_with_delay).grid(row=11, column=1)
+        Button(self.root, text="Force Stop", command=self.force_stop_capture).grid(row=11, column=2)
 
         self.display_twilight_times()
 
@@ -288,6 +327,9 @@ class StreamCapture:
                     else:
                         print("[WARNING] output_dir not found in config; using default")
 
+                    self.camera_id.set(config.get("camera_id", "CAM1"))
+                    self.camera_serial.set(config.get("serial", ""))
+
             except json.JSONDecodeError as e:
                 print(f"[ERROR] Failed to decode config JSON: {e}")
             except Exception as e:
@@ -312,11 +354,13 @@ class StreamCapture:
         """
         print("[DEBUG] Saving config... ")
         config = {
+            "camera_id": self.camera_id.get().strip(),
+            "serial": self.camera_serial.get().strip(),
             "latitude": self.latitude.get(),
             "longitude": self.longitude.get(),
             "stop_time_offset": self.stop_time_offset.get(),
             "start_time_offset": self.start_time_offset.get(),
-            "rtsp_url": self.rtsp_url.get(),
+            "rtsp_url": self.rtsp_url.get().strip(),
             "output_dir": self.output_dir.get()
         }
         try:
@@ -361,7 +405,7 @@ class StreamCapture:
     def display_twilight_times(self):
         local_tz = datetime.now().astimezone().tzinfo
         frame = Frame(self.root)
-        frame.grid(row=10, column=0, columnspan=3, sticky="w")
+        frame.grid(row=12, column=0, columnspan=3, sticky="w")
 
         def fmt(dt):
             return dt.strftime("%H:%M") + " UTC / " + dt.astimezone(local_tz).strftime("%H:%M %Z")

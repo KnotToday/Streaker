@@ -20,6 +20,7 @@ import re
 from collections import deque
 from datetime import datetime
 import time
+import gc
 
 try:
     from StreakerPlayer import launch_player
@@ -27,21 +28,29 @@ try:
 except ImportError:
     _PLAYER_AVAILABLE = False
 
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])),
-                           'streaker_config.json')
+if getattr(sys, 'frozen', False):
+    _BASE_DIR = os.path.dirname(sys.executable)
+else:
+    _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-from platform_utils import FFMPEG_PATH, HWACCEL_ARGS, NO_WINDOW, play_completion_sound
+CONFIG_PATH   = os.path.join(_BASE_DIR, 'streaker_config.json')
+CAMERAS_PATH  = os.path.join(_BASE_DIR, 'cameras.json')
+
+from platform_utils import (FFMPEG_PATH, HWACCEL_ARGS, NO_WINDOW,
+                            play_completion_sound, PYTHON_EXE,
+                            find_companion_script)
 
 # ------------------------------------------------------------------------------
 # Detection Parameters (defaults — all tunable in GUI)
 # ------------------------------------------------------------------------------
 
-DEFAULT_MOG2_HISTORY       = 500
+DEFAULT_MOG2_HISTORY       = 250
 DEFAULT_MOG2_THRESHOLD     = 40
 DEFAULT_MIN_CONTOUR_AREA   = 100
 DEFAULT_MAX_CONTOUR_AREA   = 5000
 DEFAULT_MIN_ASPECT_RATIO   = 2.0
 DEFAULT_MAX_TRACK_FRAMES   = 5
+DEFAULT_MAX_MATCH_DIST     = 0
 DEFAULT_PRE_BUFFER         = 30
 DEFAULT_POST_BUFFER        = 30
 DEFAULT_WARMUP_FRAMES      = 200
@@ -68,9 +77,10 @@ PREVIEW_EVERY_N = 5   # update live preview every N frames
 # ------------------------------------------------------------------------------
 
 class TrackManager:
-    def __init__(self, max_frames, iou_threshold=0.3):
+    def __init__(self, max_frames, iou_threshold=0.3, max_match_dist=0):
         self.max_frames = max_frames
         self.iou_threshold = iou_threshold
+        self.max_match_dist = max_match_dist  # px; 0 = disabled
         self.tracks = []
 
     def _iou(self, a, b):
@@ -89,6 +99,10 @@ class TrackManager:
         x, y, w, h = bbox
         return x + w / 2, y + h / 2
 
+    @staticmethod
+    def _dist(a, b):
+        return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5
+
     def update(self, detections, min_displacement=0):
         matched = set()
         for track in self.tracks:
@@ -98,7 +112,20 @@ class TrackManager:
                 iou = self._iou(track['bbox'], det)
                 if iou > best_iou:
                     best_iou, best_i = iou, i
-            if best_iou >= self.iou_threshold:
+
+            if best_iou < self.iou_threshold and self.max_match_dist > 0:
+                # IoU failed — fall back to nearest centroid within max_match_dist
+                best_dist, best_i = float('inf'), -1
+                tc = self._center(track['bbox'])
+                for i, det in enumerate(detections):
+                    if i in matched: continue
+                    d = self._dist(tc, self._center(det))
+                    if d < best_dist:
+                        best_dist, best_i = d, i
+                if best_dist <= self.max_match_dist:
+                    best_iou = self.iou_threshold  # treat as matched
+
+            if best_iou >= self.iou_threshold and best_i >= 0:
                 track['bbox'] = detections[best_i]
                 track['age'] += 1
                 track['ghost'] = 0
@@ -258,19 +285,49 @@ def make_thumbnail(gray_frames, all_detections=None, detect_scale=1.0, params=No
 
 
 def _drain_save_queue(futures):
-    """Wait for all but the currently-running save to finish before queuing another.
-    Keeps at most one batch of frame data in memory beyond what's actively being saved."""
-    done = [f for f in futures if f.done()]
-    for f in done:
-        futures.remove(f)
-    if len(futures) >= 1:
-        futures[0].result()
-        futures.pop(0)
+    """Wait for all pending saves to finish before continuing detection.
+    Prevents simultaneous FFmpeg decode + encode competing for memory and CPU."""
+    for f in futures:
+        try:
+            f.result()
+        except Exception:
+            pass
+    futures.clear()
+
+
+class Tooltip:
+    """Hover tooltip for any Tkinter widget."""
+    def __init__(self, widget, text):
+        self._widget = widget
+        self._text   = text
+        self._win    = None
+        widget.bind('<Enter>', self._show, add='+')
+        widget.bind('<Leave>', self._hide, add='+')
+        widget.bind('<ButtonPress>', self._hide, add='+')
+
+    def _show(self, _event=None):
+        if self._win:
+            return
+        x = self._widget.winfo_rootx() + 10
+        y = self._widget.winfo_rooty() + self._widget.winfo_height() + 4
+        self._win = tw = tk.Toplevel(self._widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f'+{x}+{y}')
+        tk.Label(tw, text=self._text, justify='left',
+                 background='#ffffe0', foreground='#111111',
+                 relief='solid', borderwidth=1,
+                 font=('Arial', 8), wraplength=320,
+                 padx=6, pady=4).pack()
+
+    def _hide(self, _event=None):
+        if self._win:
+            self._win.destroy()
+            self._win = None
 
 
 class DetectionWorker:
     def __init__(self, input_path, mask_path, output_dir, params,
-                 preview_q, event_q, done_q, stop_event):
+                 preview_q, event_q, done_q, stop_event, sw_decode=False):
         self.input_path  = input_path
         self.mask_path   = mask_path
         self.output_dir  = output_dir
@@ -279,6 +336,7 @@ class DetectionWorker:
         self.event_q     = event_q
         self.done_q      = done_q
         self.stop_event  = stop_event
+        self.sw_decode   = sw_decode
 
     def run(self):
         try:
@@ -286,6 +344,19 @@ class DetectionWorker:
         except Exception as e:
             import traceback
             self.done_q.put({'error': str(e), 'trace': traceback.format_exc()})
+        finally:
+            proc = getattr(self, '_ffmpeg_proc', None)
+            if proc is not None:
+                try:
+                    proc.stdout.close()
+                except Exception:
+                    pass
+                try:
+                    proc.kill()
+                    proc.wait()
+                except Exception:
+                    pass
+                self._ffmpeg_proc = None
 
     def _run(self):
         # Use cv2 briefly just to get video dimensions and frame count
@@ -318,8 +389,8 @@ class DetectionWorker:
         seek_frame = max(0, resume_from - warmup)
         seek_sec   = seek_frame / fps
 
-        # Open FFmpeg pipe; uses CUDA hardware decoding when available
-        ffmpeg_cmd = [FFMPEG_PATH] + HWACCEL_ARGS
+        # Open FFmpeg pipe; uses CUDA hardware decoding unless SW Decode is checked
+        ffmpeg_cmd = [FFMPEG_PATH] + ([] if self.sw_decode else HWACCEL_ARGS)
         if seek_frame > 0:
             ffmpeg_cmd += ['-ss', f'{seek_sec:.3f}']
         ffmpeg_cmd += ['-i', self.input_path,
@@ -341,7 +412,8 @@ class DetectionWorker:
             history=self.params['history'],
             varThreshold=self.params['threshold'],
             detectShadows=False)
-        tracker = TrackManager(max_frames=self.params['max_track'])
+        tracker = TrackManager(max_frames=self.params['max_track'],
+                               max_match_dist=self.params.get('max_match_dist', 0))
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         cloud_detector = AdaptiveCloudDetector(window=200)
 
@@ -436,8 +508,9 @@ class DetectionWorker:
                 pending_gray.append(gray)
                 post_cd = self.params['post_buffer']
 
-                # Safety cap — flush if pending grows too large (cloud flooding)
-                if len(pending) > 200:
+                # Safety cap — flush at 100 frames (~480MB at 2592x1944 grayscale)
+                # Tracker stays alive across the flush; stitcher merges resulting clips
+                if len(pending) > 100:
                     _cfrac = sum(cloud_rolling) / max(len(cloud_rolling), 1)
                     _drain_save_queue(save_futures)
                     save_futures.append(
@@ -445,7 +518,7 @@ class DetectionWorker:
                                         list(pending), list(pending_gray), _cfrac))
                     pending.clear()
                     pending_gray.clear()
-                    post_cd = 0
+                    # post_cd intentionally not reset — keeps the event going
 
             elif post_cd > 0:
                 pending.append(entry)
@@ -635,13 +708,36 @@ class DetectionWorker:
             '-pix_fmt', 'yuv420p',
             clip_path,
         ]
-        proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE,
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                creationflags=NO_WINDOW)
-        for (_, gframe, _, _, _) in pending:
-            proc.stdin.write(gframe.tobytes())
-        proc.stdin.close()
-        proc.wait()
+        proc = None
+        try:
+            proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                    creationflags=NO_WINDOW)
+            for (_, gframe, _, _, _) in pending:
+                proc.stdin.write(gframe.tobytes())
+            proc.stdin.close()
+            proc.wait()
+            if proc.returncode != 0:
+                raise RuntimeError(f"FFmpeg exited with code {proc.returncode}")
+        except Exception:
+            import traceback
+            tb = traceback.format_exc()
+            try:
+                log_path = os.path.join(_BASE_DIR, 'streaker_error.log')
+                with open(log_path, 'a') as f:
+                    f.write(f"\n--- {__import__('datetime').datetime.now()} [mkv-fallback] ---\n{tb}\n")
+            except Exception:
+                pass
+            self.event_q.put({'warning': f"MKV write failed for {os.path.basename(event_dir)} — fell back to JPEGs. Check streaker_error.log."})
+            if proc is not None:
+                try: proc.stdin.close()
+                except Exception: pass
+                proc.kill()
+                proc.wait()
+            # Fall back to individual JPEGs
+            for (fidx, gframe, _, _, _) in pending:
+                cv2.imwrite(os.path.join(event_dir, f"frame_{fidx:06d}.jpg"),
+                            gframe, [cv2.IMWRITE_JPEG_QUALITY, 90])
 
         detect_scale = self.params.get('scale', 1.0)
         all_detections = [(fbboxes, fmask) for (_, _, _, fbboxes, fmask) in pending if fbboxes]
@@ -655,6 +751,7 @@ class DetectionWorker:
             'source_clip':  self.input_path,
             'start_frame':  pending[0][0],
             'end_frame':    pending[-1][0],
+            'n_frames':     len(pending),
             'fps':          self.params.get('fps', 20),
             'detect_scale': detect_scale,
             'detections':   det_meta,
@@ -735,6 +832,8 @@ class EventViewer:
 
         tk.Button(ctrl, text="Max-Blend Toggle",
                   command=self._toggle_composite).pack(side='left', padx=10)
+        tk.Button(ctrl, text="Save Stack",
+                  command=self._save_stack).pack(side='left', padx=4)
 
         self.scrubber = ttk.Scale(self.win, from_=0, to=len(self.frame_paths)-1,
                                   orient='horizontal',
@@ -797,6 +896,14 @@ class EventViewer:
         self.show_composite = not self.show_composite
         self._show_frame()
 
+    def _save_stack(self):
+        if self.composite is None:
+            tk.messagebox.showerror("No Stack", "No composite available for this event.")
+            return
+        out_path = os.path.join(self.event_dir, "stack.png")
+        cv2.imwrite(out_path, self.composite)
+        tk.messagebox.showinfo("Saved", f"Stack saved to:\n{out_path}")
+
     def _show_frame(self):
         if self.show_composite and self.composite is not None:
             cw = max(self.canvas.winfo_width(), 860)
@@ -830,7 +937,7 @@ class EventViewer:
 # Thumbnail Panel
 # ------------------------------------------------------------------------------
 
-PAGE_SIZE = 100
+PAGE_SIZE = 50
 
 class ThumbnailPanel:
     def __init__(self, parent, on_click):
@@ -842,16 +949,22 @@ class ThumbnailPanel:
         self.flagged    = set()
         self._flags_path = None
         self.page = 0
+        self._sort_mode = tk.StringVar(value='all')
 
         BG = '#1a1a1a'
         frame = tk.Frame(parent, bg=BG)
         frame.pack(fill='both', expand=True)
 
-        # Header row: title + page navigation
+        # Header row: title + sort + page navigation
         hdr = tk.Frame(frame, bg=BG)
         hdr.pack(fill='x')
         tk.Label(hdr, text="DETECTED EVENTS", bg=BG, fg='#aaaaaa',
                  font=('Arial', 9, 'bold')).pack(side='left', pady=(4, 0), padx=4)
+        sort_cb = ttk.Combobox(hdr, textvariable=self._sort_mode,
+                               values=['all', 'flagged_first', 'flagged_only'],
+                               state='readonly', width=13, font=('Arial', 7))
+        sort_cb.pack(side='left', padx=4, pady=2)
+        self._sort_mode.trace_add('write', lambda *_: self._on_sort_change())
         self.prev_btn = tk.Button(hdr, text="◀", command=self._prev_page,
                                   bg='#333333', fg='white', relief='flat',
                                   width=2, state='disabled')
@@ -904,11 +1017,32 @@ class ThumbnailPanel:
     def _on_canvas_resize(self, e):
         self.canvas.itemconfig(self.canvas_window, width=e.width)
 
+    @staticmethod
+    def _flag_key(path):
+        """Normalize a path for use as a flag set key — case-insensitive, consistent separators."""
+        return os.path.normcase(os.path.normpath(path))
+
+    def _view_events(self):
+        mode = self._sort_mode.get()
+        if mode == 'flagged_only':
+            return [e for e in self.all_events if self._flag_key(e['dir']) in self.flagged]
+        if mode == 'flagged_first':
+            flagged = [e for e in self.all_events if self._flag_key(e['dir']) in self.flagged]
+            rest    = [e for e in self.all_events if self._flag_key(e['dir']) not in self.flagged]
+            return flagged + rest
+        return self.all_events
+
+    def _on_sort_change(self):
+        mode = self._sort_mode.get()
+        print(f'[SORT] mode={mode!r}  flagged={len(self.flagged)}  total={len(self.all_events)}  view={len(self._view_events())}')
+        self.page = 0
+        self._render_page()
+
     def _page_count(self):
-        return max(1, (len(self.all_events) + PAGE_SIZE - 1) // PAGE_SIZE)
+        return max(1, (len(self._view_events()) + PAGE_SIZE - 1) // PAGE_SIZE)
 
     def _update_nav(self):
-        total = len(self.all_events)
+        total = len(self._view_events())
         pages = self._page_count()
         if total == 0:
             self.page_var.set("")
@@ -936,14 +1070,14 @@ class ThumbnailPanel:
         self._flag_vars.clear()
         self.canvas.yview_moveto(0)
         start = self.page * PAGE_SIZE
-        for i, ev in enumerate(self.all_events[start:start + PAGE_SIZE]):
+        for i, ev in enumerate(self._view_events()[start:start + PAGE_SIZE]):
             self._render_card(ev, start + i)
         self._update_nav()
         self.canvas.after_idle(self._refresh_scrollregion)
 
     def _card_colors(self, event_dir):
         """Return (bg, border_color, border_thickness) based on flagged/visited state."""
-        if event_dir in self.flagged:
+        if self._flag_key(event_dir) in self.flagged:
             return '#2a2410', '#ffd700', 2
         elif event_dir in self.visited:
             return '#1a3a22', '#33aa55', 2
@@ -1001,7 +1135,7 @@ class ThumbnailPanel:
         tk.Label(top_row, text=f"Event {global_idx + 1}",
                  bg=card_bg, fg='white',
                  font=('Arial', 10, 'bold')).pack(side='left')
-        flag_text = tk.StringVar(value="⭐" if event_dir in self.flagged else "☆")
+        flag_text = tk.StringVar(value="⭐" if self._flag_key(event_dir) in self.flagged else "☆")
         self._flag_vars.append(flag_text)
         def _toggle(d=event_dir, c=card, v=flag_text):
             self._toggle_flag(d, c, v)
@@ -1026,7 +1160,7 @@ class ThumbnailPanel:
 
     def select_event(self, event_dir):
         """Highlight the card for event_dir; switch page if needed and scroll to it."""
-        idx = next((i for i, e in enumerate(self.all_events) if e['dir'] == event_dir), -1)
+        idx = next((i for i, e in enumerate(self._view_events()) if e['dir'] == event_dir), -1)
         if idx < 0:
             return
         target_page = idx // PAGE_SIZE
@@ -1049,34 +1183,41 @@ class ThumbnailPanel:
         self.canvas.yview_moveto(frac)
 
     def _toggle_flag(self, event_dir, card, flag_var):
-        if event_dir in self.flagged:
-            self.flagged.discard(event_dir)
+        key = self._flag_key(event_dir)
+        if key in self.flagged:
+            self.flagged.discard(key)
             flag_var.set("☆")
         else:
-            self.flagged.add(event_dir)
+            self.flagged.add(key)
             flag_var.set("⭐")
         self._apply_card_colors(card, event_dir)
         self._save_flags()
         self._update_delete_btn()
 
     def _load_flags(self):
+        print(f'[FLAGS] load → path={self._flags_path!r}  exists={self._flags_path and os.path.exists(self._flags_path)}')
         if self._flags_path and os.path.exists(self._flags_path):
             try:
                 with open(self._flags_path) as f:
-                    self.flagged = set(json.load(f))
-            except Exception:
+                    self.flagged = set(
+                        os.path.normcase(os.path.normpath(p)) for p in json.load(f))
+                print(f'[FLAGS] loaded {len(self.flagged)} flag(s): {self.flagged}')
+            except Exception as e:
+                print(f'[FLAGS] load FAILED: {e}')
                 self.flagged = set()
 
     def _save_flags(self):
+        print(f'[FLAGS] save → path={self._flags_path!r}  flagged={self.flagged}')
         if self._flags_path:
             try:
                 with open(self._flags_path, 'w') as f:
                     json.dump(list(self.flagged), f)
-            except Exception:
-                pass
+                print(f'[FLAGS] saved OK')
+            except Exception as e:
+                print(f'[FLAGS] save FAILED: {e}')
 
     def _update_delete_btn(self):
-        n_flagged   = sum(1 for e in self.all_events if e['dir'] in self.flagged)
+        n_flagged   = sum(1 for e in self.all_events if self._flag_key(e['dir']) in self.flagged)
         n_unflagged = len(self.all_events) - n_flagged
         if n_flagged > 0 and n_unflagged > 0:
             self.delete_btn.config(state='normal', text="🗑 Delete Unflagged")
@@ -1093,7 +1234,7 @@ class ThumbnailPanel:
 
     def _delete_unflagged(self):
         import shutil
-        unflagged = [e for e in self.all_events if e['dir'] not in self.flagged]
+        unflagged = [e for e in self.all_events if self._flag_key(e['dir']) not in self.flagged]
         n = len(unflagged)
         n_keep = len(self.all_events) - n
         if n_keep == 0:
@@ -1113,7 +1254,7 @@ class ThumbnailPanel:
                 shutil.rmtree(e['dir'])
             except Exception as ex:
                 errors.append(f"{os.path.basename(e['dir'])}: {ex}")
-        self.all_events = [e for e in self.all_events if e['dir'] in self.flagged]
+        self.all_events = [e for e in self.all_events if self._flag_key(e['dir']) in self.flagged]
         self._render_page()
         self._update_delete_btn()
         if errors:
@@ -1129,10 +1270,13 @@ class ThumbnailPanel:
         self.flagged.clear()
         self._flags_path = None
         self.page = 0
+        self.canvas.yview_moveto(0)
         self._update_nav()
         self._update_delete_btn()
 
     def add_event(self, event_info):
+        event_info = dict(event_info)
+        event_info['dir'] = os.path.normpath(event_info['dir'])
         if self._flags_path is None:
             clips_dir = os.path.dirname(event_info['dir'])
             self._flags_path = os.path.join(clips_dir, '_flags.json')
@@ -1268,33 +1412,56 @@ class EventStitcher:
                                   f"event_{src}_{mm:02d}m{ss:02d}s_stitched_{ts}")
         os.makedirs(merged_dir, exist_ok=True)
 
-        # Copy ev_a frames
-        for f in sorted(os.listdir(ev_a['event_dir'])):
-            if f.startswith('frame_') and f.endswith('.jpg'):
-                src_path = os.path.join(ev_a['event_dir'], f)
-                cv2.imwrite(os.path.join(merged_dir, f),
-                            cv2.imread(src_path, cv2.IMREAD_GRAYSCALE),
-                            [cv2.IMWRITE_JPEG_QUALITY, 90])
+        clip_a = os.path.join(ev_a['event_dir'], 'clip.mkv')
+        clip_b = os.path.join(ev_b['event_dir'], 'clip.mkv')
+        if not os.path.exists(clip_a) or not os.path.exists(clip_b):
+            return None
 
-        # Extract gap frames from original MKV via FFmpeg
-        gap_start = ev_a['end_frame'] + 1
-        gap_end   = ev_b['start_frame'] - 1
+        gap_start        = ev_a['end_frame'] + 1
+        gap_end          = ev_b['start_frame'] - 1
         gap_frame_indices = list(range(gap_start, gap_end + 1))
+
+        # Extract gap frames from original recording as a temp MKV
+        gap_clip = None
         if gap_frame_indices and os.path.exists(clip_path):
-            self._extract_gap_frames(clip_path, gap_frame_indices,
-                                     merged_dir, fps)
+            gap_clip = os.path.join(merged_dir, '_gap.mkv')
+            self._extract_gap_mkv(clip_path, clip_a, gap_start,
+                                   len(gap_frame_indices), fps, gap_clip)
+            if not os.path.exists(gap_clip) or os.path.getsize(gap_clip) == 0:
+                gap_clip = None
 
-        # Copy ev_b frames
-        for f in sorted(os.listdir(ev_b['event_dir'])):
-            if f.startswith('frame_') and f.endswith('.jpg'):
-                src_path = os.path.join(ev_b['event_dir'], f)
-                cv2.imwrite(os.path.join(merged_dir, f),
-                            cv2.imread(src_path, cv2.IMREAD_GRAYSCALE),
-                            [cv2.IMWRITE_JPEG_QUALITY, 90])
+        # Concatenate: ev_a clip + gap + ev_b clip → merged clip.mkv
+        concat_parts = [clip_a]
+        if gap_clip:
+            concat_parts.append(gap_clip)
+        concat_parts.append(clip_b)
 
-        # Mark gap frames
-        with open(os.path.join(merged_dir, '_gap_frames.txt'), 'w') as f:
-            f.write('\n'.join(str(i) for i in gap_frame_indices))
+        concat_txt = os.path.join(merged_dir, '_concat.txt')
+        with open(concat_txt, 'w', encoding='utf-8') as f:
+            for p in concat_parts:
+                f.write(f"file '{p.replace(chr(92), chr(47))}'\n")
+
+        merged_clip = os.path.join(merged_dir, 'clip.mkv')
+        try:
+            subprocess.run(
+                [self.ffmpeg_path, '-y', '-f', 'concat', '-safe', '0',
+                 '-i', concat_txt, '-c', 'copy', merged_clip],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=NO_WINDOW)
+        except Exception:
+            pass
+
+        for tmp in [concat_txt, gap_clip]:
+            if tmp and os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
+
+        # Mark gap frame indices
+        if gap_frame_indices:
+            with open(os.path.join(merged_dir, '_gap_frames.txt'), 'w') as f:
+                f.write('\n'.join(str(i) for i in gap_frame_indices))
 
         # Combined metadata
         combined_dets = (ev_a['detections'] +
@@ -1308,61 +1475,115 @@ class EventStitcher:
             'fps':         fps,
             'stitched':    True,
             'detections':  combined_dets,
+            'event_dir':   merged_dir,
         }
         with open(os.path.join(merged_dir, 'metadata.json'), 'w') as f:
-            json.dump(meta, f, indent=2)
+            json.dump({k: v for k, v in meta.items() if k != 'event_dir'}, f, indent=2)
 
-        # Regenerate thumbnail from all frames
-        all_frames = sorted([
-            os.path.join(merged_dir, f) for f in os.listdir(merged_dir)
-            if f.startswith('frame_') and f.endswith('.jpg')])
-        grays = [cv2.imread(p, cv2.IMREAD_GRAYSCALE) for p in all_frames]
-        grays = [g for g in grays if g is not None]
-        thumb = make_thumbnail(grays)
-        if thumb is not None:
-            cv2.imwrite(os.path.join(merged_dir, '_thumbnail.jpg'), thumb)
+        if os.path.exists(merged_clip):
+            thumb = self._make_thumbnail_from_mkv(merged_clip)
+            if thumb is not None:
+                cv2.imwrite(os.path.join(merged_dir, '_thumbnail.jpg'), thumb)
+
+            import shutil
+            for orig_dir in (ev_a['event_dir'], ev_b['event_dir']):
+                try:
+                    shutil.rmtree(orig_dir)
+                except Exception as e:
+                    print(f'[STITCH] Could not remove {orig_dir}: {e}')
 
         return meta
 
-    def _extract_gap_frames(self, clip_path, frame_indices, out_dir, fps):
-        if not frame_indices:
+    def _extract_gap_mkv(self, src_clip, ref_clip, start_frame, frame_count, fps, out_path):
+        """Extract frame_count frames from src_clip at start_frame into out_path (MKV).
+        Matches resolution and grayscale encoding of ref_clip (an existing event clip.mkv)."""
+        cap = cv2.VideoCapture(ref_clip)
+        if not cap.isOpened():
             return
-        start = frame_indices[0]
-        count = len(frame_indices)
-        start_sec = start / fps
-        cmd = [
-            self.ffmpeg_path,
-            *HWACCEL_ARGS,
-            '-ss', str(start_sec),
-            '-i', clip_path,
-            '-frames:v', str(count),
-            '-f', 'rawvideo',
-            '-pix_fmt', 'gray',
-            'pipe:1',
-        ]
+        fw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        fh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        cap.release()
+        if fw == 0 or fh == 0:
+            return
+
+        start_sec = start_frame / fps
+        reader = None
+        writer = None
         try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                    stderr=subprocess.DEVNULL,
-                                    creationflags=NO_WINDOW)
-            # Get frame dimensions from first existing frame in out_dir
-            sample = sorted([f for f in os.listdir(out_dir)
-                             if f.startswith('frame_')])[0]
-            sample_img = cv2.imread(os.path.join(out_dir, sample),
-                                    cv2.IMREAD_GRAYSCALE)
-            if sample_img is None:
-                proc.kill(); return
-            fh, fw = sample_img.shape
+            reader = subprocess.Popen(
+                [self.ffmpeg_path, *HWACCEL_ARGS,
+                 '-ss', f'{start_sec:.3f}', '-i', src_clip,
+                 '-frames:v', str(frame_count),
+                 '-vf', f'scale={fw}:{fh},format=gray',
+                 '-f', 'rawvideo', '-pix_fmt', 'gray', 'pipe:1'],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                creationflags=NO_WINDOW)
+            writer = subprocess.Popen(
+                [self.ffmpeg_path, '-y',
+                 '-f', 'rawvideo', '-pix_fmt', 'gray',
+                 '-s', f'{fw}x{fh}', '-r', str(fps), '-i', 'pipe:0',
+                 '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
+                 '-pix_fmt', 'yuv420p', out_path],
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, creationflags=NO_WINDOW)
             frame_bytes = fw * fh
-            for fidx in frame_indices:
-                raw = proc.stdout.read(frame_bytes)
-                if len(raw) == frame_bytes:
-                    frame_arr = np.frombuffer(raw, dtype=np.uint8).reshape(fh, fw)
-                    fpath = os.path.join(out_dir, f"frame_{fidx:06d}.jpg")
-                    cv2.imwrite(fpath, frame_arr, [cv2.IMWRITE_JPEG_QUALITY, 90])
-            proc.stdout.close()
-            proc.wait()
+            for _ in range(frame_count):
+                raw = reader.stdout.read(frame_bytes)
+                if len(raw) < frame_bytes:
+                    break
+                writer.stdin.write(raw)
+            reader.stdout.close()
+            reader.wait(timeout=15)
+            writer.stdin.close()
+            writer.wait(timeout=30)
         except Exception:
             pass
+        finally:
+            for p in [reader, writer]:
+                if p is not None:
+                    try:
+                        p.kill()
+                    except Exception:
+                        pass
+
+    def _make_thumbnail_from_mkv(self, mkv_path, max_frames=300):
+        """Decode up to max_frames from mkv_path and return a max-blend thumbnail."""
+        cap = cv2.VideoCapture(mkv_path)
+        if not cap.isOpened():
+            return None
+        fw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        fh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        cap.release()
+        if fw == 0 or fh == 0:
+            return None
+
+        gray_frames = []
+        proc = None
+        try:
+            proc = subprocess.Popen(
+                [self.ffmpeg_path, '-i', mkv_path,
+                 '-vframes', str(max_frames),
+                 '-f', 'rawvideo', '-pix_fmt', 'gray', 'pipe:1'],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                creationflags=NO_WINDOW)
+            frame_bytes = fw * fh
+            while True:
+                raw = proc.stdout.read(frame_bytes)
+                if len(raw) < frame_bytes:
+                    break
+                gray_frames.append(
+                    np.frombuffer(raw, dtype=np.uint8).reshape(fh, fw))
+            proc.stdout.close()
+            proc.wait(timeout=15)
+        except Exception:
+            pass
+        finally:
+            if proc is not None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        return make_thumbnail(gray_frames) if gray_frames else None
 
 
 # ==============================================================================
@@ -1375,16 +1596,19 @@ class StreakerDetectApp:
         master.title(f"StreakerDetect  v{VERSION}")
         master.configure(bg='#111111')
 
-        self.input_path = tk.StringVar()
-        self.mask_path  = tk.StringVar()
-        self.output_dir = tk.StringVar()
+        self.input_path  = tk.StringVar()
+        self.mask_path   = tk.StringVar()
+        self.output_dir  = tk.StringVar()
+        self._cameras    = []        # list of profile dicts
+        self._camera_var = tk.StringVar()
 
         self.p_history   = tk.IntVar(value=DEFAULT_MOG2_HISTORY)
         self.p_threshold = tk.IntVar(value=DEFAULT_MOG2_THRESHOLD)
         self.p_min_area  = tk.IntVar(value=DEFAULT_MIN_CONTOUR_AREA)
         self.p_max_area  = tk.IntVar(value=DEFAULT_MAX_CONTOUR_AREA)
         self.p_min_asp   = tk.DoubleVar(value=DEFAULT_MIN_ASPECT_RATIO)
-        self.p_max_track = tk.IntVar(value=DEFAULT_MAX_TRACK_FRAMES)
+        self.p_max_track      = tk.IntVar(value=DEFAULT_MAX_TRACK_FRAMES)
+        self.p_max_match_dist = tk.IntVar(value=DEFAULT_MAX_MATCH_DIST)
         self.p_pre_buf   = tk.IntVar(value=DEFAULT_PRE_BUFFER)
         self.p_post_buf  = tk.IntVar(value=DEFAULT_POST_BUFFER)
         self.p_warmup    = tk.IntVar(value=DEFAULT_WARMUP_FRAMES)
@@ -1399,6 +1623,8 @@ class StreakerDetectApp:
         self.p_cloud_min_bright = tk.IntVar(value=0)
         self.p_cloud_min_travel = tk.IntVar(value=0)
         self.p_force_rerun      = tk.BooleanVar(value=False)
+        self.p_no_hwaccel       = tk.BooleanVar(value=False)
+        self.p_auto_stitch      = tk.BooleanVar(value=False)
 
         self.preview_q = queue.Queue(maxsize=2)
         self.event_q   = queue.Queue()
@@ -1436,6 +1662,7 @@ class StreakerDetectApp:
     # --------------------------------------------------------------------------
 
     def _load_config(self):
+        self._load_cameras()
         if not os.path.exists(CONFIG_PATH):
             return
         try:
@@ -1449,7 +1676,8 @@ class StreakerDetectApp:
             self.p_min_area.set(c.get('min_area',    DEFAULT_MIN_CONTOUR_AREA))
             self.p_max_area.set(c.get('max_area',    DEFAULT_MAX_CONTOUR_AREA))
             self.p_min_asp.set(c.get('min_aspect',   DEFAULT_MIN_ASPECT_RATIO))
-            self.p_max_track.set(c.get('max_track',  DEFAULT_MAX_TRACK_FRAMES))
+            self.p_max_track.set(c.get('max_track',       DEFAULT_MAX_TRACK_FRAMES))
+            self.p_max_match_dist.set(c.get('max_match_dist', DEFAULT_MAX_MATCH_DIST))
             self.p_pre_buf.set(c.get('pre_buffer',   DEFAULT_PRE_BUFFER))
             self.p_post_buf.set(c.get('post_buffer', DEFAULT_POST_BUFFER))
             self.p_warmup.set(c.get('warmup',        DEFAULT_WARMUP_FRAMES))
@@ -1475,7 +1703,8 @@ class StreakerDetectApp:
                 'min_area':    self.p_min_area.get(),
                 'max_area':    self.p_max_area.get(),
                 'min_aspect':  self.p_min_asp.get(),
-                'max_track':   self.p_max_track.get(),
+                'max_track':      self.p_max_track.get(),
+                'max_match_dist': self.p_max_match_dist.get(),
                 'pre_buffer':  self.p_pre_buf.get(),
                 'post_buffer': self.p_post_buf.get(),
                 'warmup':      self.p_warmup.get(),
@@ -1494,6 +1723,173 @@ class StreakerDetectApp:
                 json.dump(c, f, indent=2)
         except Exception:
             pass
+
+    # --------------------------------------------------------------------------
+    # Camera profiles
+    # --------------------------------------------------------------------------
+
+    def _load_cameras(self):
+        if not os.path.exists(CAMERAS_PATH):
+            return
+        try:
+            with open(CAMERAS_PATH) as f:
+                data = json.load(f)
+            self._cameras = data.get('cameras', [])
+            self._camera_combo['values'] = [c['name'] for c in self._cameras]
+            last = data.get('last_used', '')
+            if last and last in [c['name'] for c in self._cameras]:
+                self._camera_var.set(last)
+                self._apply_camera_profile(last)
+        except Exception:
+            pass
+
+    def _save_cameras(self):
+        try:
+            with open(CAMERAS_PATH, 'w') as f:
+                json.dump({'cameras': self._cameras,
+                           'last_used': self._camera_var.get()}, f, indent=2)
+        except Exception:
+            pass
+
+    def _apply_camera_profile(self, name):
+        for cam in self._cameras:
+            if cam['name'] == name:
+                if cam.get('input_dir'):
+                    self.input_path.set(cam['input_dir'])
+                if cam.get('output_dir'):
+                    self.output_dir.set(cam['output_dir'])
+                if cam.get('mask_path'):
+                    self.mask_path.set(cam['mask_path'])
+                return
+
+    def _camera_on_select(self, _event=None):
+        name = self._camera_var.get()
+        self._apply_camera_profile(name)
+        self._save_cameras()
+
+    def _camera_add(self):
+        self._camera_dialog("Add Camera")
+
+    def _camera_edit(self):
+        name = self._camera_var.get()
+        if not name:
+            messagebox.showwarning("No Selection", "Select a camera profile to edit.")
+            return
+        profile = next((c for c in self._cameras if c['name'] == name), None)
+        self._camera_dialog("Edit Camera", profile)
+
+    def _camera_delete(self):
+        name = self._camera_var.get()
+        if not name:
+            messagebox.showwarning("No Selection", "Select a camera profile to delete.")
+            return
+        if not messagebox.askyesno("Delete Camera",
+                                   f"Delete profile '{name}'?"):
+            return
+        self._cameras = [c for c in self._cameras if c['name'] != name]
+        self._camera_var.set('')
+        self._camera_combo['values'] = [c['name'] for c in self._cameras]
+        self._save_cameras()
+
+    def _camera_dialog(self, title, profile=None):
+        dlg = tk.Toplevel(self.root)
+        dlg.title(title)
+        dlg.configure(bg='#1e1e1e')
+        dlg.resizable(False, False)
+        dlg.grab_set()
+
+        BG, FG = '#1e1e1e', '#dddddd'
+        pad = dict(padx=8, pady=4)
+
+        def lbl(text):
+            tk.Label(dlg, text=text, bg=BG, fg='#888888',
+                     font=('Arial', 8)).pack(anchor='w', padx=10, pady=(6, 0))
+
+        def entry_row(var):
+            f = tk.Frame(dlg, bg=BG)
+            f.pack(fill='x', padx=10, pady=(0, 2))
+            e = tk.Entry(f, textvariable=var, bg='#2a2a2a', fg=FG,
+                         insertbackground=FG, relief='flat', width=42)
+            e.pack(side='left', fill='x', expand=True)
+            return f, e
+
+        def browse_dir(var):
+            p = filedialog.askdirectory()
+            if p:
+                var.set(p)
+
+        def browse_file(var):
+            p = filedialog.askopenfilename(filetypes=[("PNG", "*.png"), ("All", "*.*")])
+            if p:
+                var.set(p)
+
+        v_name   = tk.StringVar(value=profile['name']       if profile else '')
+        v_input  = tk.StringVar(value=profile.get('input_dir',  '') if profile else '')
+        v_output = tk.StringVar(value=profile.get('output_dir', '') if profile else '')
+        v_mask   = tk.StringVar(value=profile.get('mask_path',  '') if profile else '')
+
+        lbl("Camera name:")
+        _, e_name = entry_row(v_name)
+        e_name.focus_set()
+
+        lbl("Input folder (where recordings land):")
+        fr, _ = entry_row(v_input)
+        tk.Button(fr, text="…", command=lambda: browse_dir(v_input),
+                  bg='#444', fg=FG, relief='flat', width=2).pack(side='left', padx=(2, 0))
+
+        lbl("Output folder (detection results):")
+        fr, _ = entry_row(v_output)
+        tk.Button(fr, text="…", command=lambda: browse_dir(v_output),
+                  bg='#444', fg=FG, relief='flat', width=2).pack(side='left', padx=(2, 0))
+
+        lbl("Mask path (optional):")
+        fr, _ = entry_row(v_mask)
+        tk.Button(fr, text="…", command=lambda: browse_file(v_mask),
+                  bg='#444', fg=FG, relief='flat', width=2).pack(side='left', padx=(2, 0))
+        def _launch_mask_editor():
+            script = find_companion_script('Mask_editor_gui.py')
+            subprocess.Popen([PYTHON_EXE, script], creationflags=NO_WINDOW)
+        tk.Button(fr, text="✎ Edit", command=_launch_mask_editor,
+                  bg='#444', fg=FG, relief='flat').pack(side='left', padx=(2, 0))
+
+        def _save():
+            name = v_name.get().strip()
+            if not name:
+                messagebox.showerror("Error", "Camera name is required.", parent=dlg)
+                return
+            new_profile = {
+                'name':       name,
+                'input_dir':  v_input.get().strip(),
+                'output_dir': v_output.get().strip(),
+                'mask_path':  v_mask.get().strip(),
+            }
+            if profile:
+                # Replace existing
+                for i, c in enumerate(self._cameras):
+                    if c['name'] == profile['name']:
+                        self._cameras[i] = new_profile
+                        break
+            else:
+                if any(c['name'] == name for c in self._cameras):
+                    messagebox.showerror("Error", f"A camera named '{name}' already exists.",
+                                         parent=dlg)
+                    return
+                self._cameras.append(new_profile)
+            self._camera_combo['values'] = [c['name'] for c in self._cameras]
+            self._camera_var.set(name)
+            self._apply_camera_profile(name)
+            self._save_cameras()
+            dlg.destroy()
+
+        btn_f = tk.Frame(dlg, bg=BG)
+        btn_f.pack(pady=10)
+        tk.Button(btn_f, text="Save", command=_save,
+                  bg='#0057a8', fg='white', relief='flat',
+                  font=('Arial', 9, 'bold'), padx=12).pack(side='left', padx=6)
+        tk.Button(btn_f, text="Cancel", command=dlg.destroy,
+                  bg='#444', fg=FG, relief='flat', padx=8).pack(side='left')
+
+        dlg.wait_window()
 
     def _on_close(self):
         self._save_config()
@@ -1522,16 +1918,21 @@ class StreakerDetectApp:
             tk.Button(r, text="…", command=cmd, bg='#444444', fg='white',
                       relief='flat', width=2).pack(side='left', padx=(1, 0))
 
-        def slider(parent, label, var, lo, hi, res):
+        def slider(parent, label, var, lo, hi, res, tip=None):
             f = tk.Frame(parent, bg=BG)
             f.pack(side='left', padx=3, pady=2)
-            tk.Label(f, text=label, bg=BG, fg='white',
-                     font=('Arial', 7)).pack(anchor='w')
-            tk.Scale(f, from_=lo, to=hi, resolution=res, variable=var,
-                     orient='horizontal', bg=BG, fg='white',
-                     troughcolor='#333333', highlightthickness=0,
-                     length=150, showvalue=True,
-                     font=('Arial', 7)).pack()
+            lbl = tk.Label(f, text=label, bg=BG, fg='white',
+                           font=('Arial', 7))
+            lbl.pack(anchor='w')
+            sc = tk.Scale(f, from_=lo, to=hi, resolution=res, variable=var,
+                          orient='horizontal', bg=BG, fg='white',
+                          troughcolor='#333333', highlightthickness=0,
+                          length=150, showvalue=True,
+                          font=('Arial', 7))
+            sc.pack()
+            if tip:
+                Tooltip(lbl, tip)
+                Tooltip(sc, tip)
 
         # ── Outer split: left controls+canvas | right thumbnails ──────────
         outer = tk.Frame(self.root, bg=BG)
@@ -1546,6 +1947,25 @@ class StreakerDetectApp:
         # Left section — rows + canvas
         left_section = tk.Frame(outer, bg=BG)
         left_section.pack(side='left', fill='both', expand=True)
+
+        # ── Camera profile row ────────────────────────────────────────────────
+        r0 = tk.Frame(left_section, bg=BG)
+        r0.pack(fill='x', side='top', padx=6, pady=(3, 0))
+        tk.Label(r0, text="Camera:", bg=BG, fg='#888888',
+                 font=('Arial', 8)).pack(side='left', padx=(0, 4))
+        self._camera_combo = ttk.Combobox(r0, textvariable=self._camera_var,
+                                          state='readonly', width=28, font=('Arial', 9))
+        self._camera_combo.pack(side='left', padx=(0, 4))
+        self._camera_combo.bind('<<ComboboxSelected>>', self._camera_on_select)
+        tk.Button(r0, text="+ Add",   command=self._camera_add,
+                  bg='#226622', fg='white', relief='flat',
+                  font=('Arial', 8), padx=4).pack(side='left', padx=2)
+        tk.Button(r0, text="✎ Edit",  command=self._camera_edit,
+                  bg='#444444', fg='white', relief='flat',
+                  font=('Arial', 8), padx=4).pack(side='left', padx=2)
+        tk.Button(r0, text="🗑 Delete", command=self._camera_delete,
+                  bg='#662222', fg='white', relief='flat',
+                  font=('Arial', 8), padx=4).pack(side='left', padx=2)
 
         # ── Row 1 sub-row A: title | input + output | run/stop/stitch/open ─
         r1a = tk.Frame(left_section, bg=BG)
@@ -1564,6 +1984,7 @@ class StreakerDetectApp:
         inp_r.pack()
         tk.Entry(inp_r, textvariable=self.input_path, bg='#2a2a2a', fg='white',
                  relief='flat', width=30).pack(side='left')
+
         tk.Button(inp_r, text="…", command=self._browse_input, bg='#444444', fg='white',
                   relief='flat', width=2).pack(side='left', padx=(1, 0))
         tk.Button(inp_r, text="📁", command=self._browse_input_folder, bg='#444444', fg='white',
@@ -1575,15 +1996,25 @@ class StreakerDetectApp:
 
         btn_f = tk.Frame(r1a, bg=BG)
         btn_f.pack(side='left', padx=4, pady=2)
-        tk.Checkbutton(btn_f, text="Force Re-run", variable=self.p_force_rerun,
-                       bg=BG, fg='#aaaaaa', selectcolor='#333333',
-                       font=('Arial', 8), activebackground=BG).pack(side='left', padx=(2, 6))
+        _cb_force = tk.Checkbutton(btn_f, text="Force Re-run", variable=self.p_force_rerun,
+                                   bg=BG, fg='#aaaaaa', selectcolor='#333333',
+                                   font=('Arial', 8), activebackground=BG)
+        _cb_force.pack(side='left', padx=(2, 6))
+        Tooltip(_cb_force, "Re-process clips that were already completed. "
+                "Also clears any partial checkpoints so clips restart from frame 0.")
+        _cb_sw = tk.Checkbutton(btn_f, text="SW Decode", variable=self.p_no_hwaccel,
+                                bg=BG, fg='#aaaaaa', selectcolor='#333333',
+                                font=('Arial', 8), activebackground=BG)
+        _cb_sw.pack(side='left', padx=(0, 6))
+        Tooltip(_cb_sw, "Use software (CPU) decoding instead of NVIDIA CUDA hardware decoding. "
+                "Enable if you see phantom streaks or corrupted frames in event clips.")
         self.run_btn = tk.Button(btn_f, text="▶ RUN",
                                  command=self._start_detection,
                                  bg='#006600', fg='white',
                                  font=('Arial', 9, 'bold'),
                                  relief='flat', padx=10, pady=3)
         self.run_btn.pack(side='left', padx=2)
+        Tooltip(self.run_btn, "Start detection on the selected input folder or MKV clip.")
         self.stop_btn = tk.Button(btn_f, text="■ STOP",
                                   command=self._stop_detection,
                                   bg='#660000', fg='white',
@@ -1591,16 +2022,46 @@ class StreakerDetectApp:
                                   relief='flat', padx=10, pady=3,
                                   state='disabled')
         self.stop_btn.pack(side='left', padx=2)
-        tk.Button(btn_f, text="🔗 STITCH",
-                  command=self._run_stitcher,
-                  bg='#334455', fg='white',
-                  font=('Arial', 9, 'bold'),
-                  relief='flat', padx=10, pady=3).pack(side='left', padx=2)
-        tk.Button(btn_f, text="📂 OPEN EVENTS",
-                  command=self._open_events_folder,
-                  bg='#1a4a6a', fg='white',
-                  font=('Arial', 9, 'bold'),
-                  relief='flat', padx=10, pady=3).pack(side='left', padx=2)
+        Tooltip(self.stop_btn, "Stop detection after the current clip finishes. "
+                "Progress is saved — you can resume from where it stopped next time.")
+        _btn_stitch = tk.Button(btn_f, text="🔗 STITCH",
+                                command=self._run_stitcher,
+                                bg='#334455', fg='white',
+                                font=('Arial', 9, 'bold'),
+                                relief='flat', padx=10, pady=3)
+        _btn_stitch.pack(side='left', padx=2)
+        Tooltip(_btn_stitch, "Merge nearby event clips from the same object into one. "
+                "Useful when a plane or satellite was split into multiple short clips.")
+        _auto_cb = tk.Checkbutton(btn_f, text="auto", variable=self.p_auto_stitch,
+                                   bg=BG, fg='#888888', selectcolor='#334455',
+                                   activebackground=BG, activeforeground='#dddddd',
+                                   font=('Arial', 8), cursor='hand2')
+        _auto_cb.pack(side='left', padx=(0, 6))
+        Tooltip(_auto_cb, "Automatically stitch events after each detection run completes.")
+        self._btn_identify = tk.Button(btn_f, text="🔎 IDENTIFY",
+                                   command=self._run_identify,
+                                   bg='#1a3a1a', fg='white',
+                                   font=('Arial', 9, 'bold'),
+                                   relief='flat', padx=10, pady=3)
+        self._btn_identify.pack(side='left', padx=2)
+        Tooltip(self._btn_identify,
+                "Run the identification pass on a detect folder — classifies each event "
+                "as meteor / aircraft / satellite / unknown and flags anomalies. "
+                "Writes identification.json per event.")
+        self._identify_cancel = threading.Event()
+        _btn_open = tk.Button(btn_f, text="📂 OPEN EVENTS",
+                              command=self._open_events_folder,
+                              bg='#1a4a6a', fg='white',
+                              font=('Arial', 9, 'bold'),
+                              relief='flat', padx=10, pady=3)
+        _btn_open.pack(side='left', padx=2)
+        Tooltip(_btn_open, "Open the current detection output folder in Windows Explorer.")
+        self._events_folder_var     = tk.StringVar(value="")
+        self._events_folder_full    = ""
+        _folder_lbl = tk.Label(btn_f, textvariable=self._events_folder_var, bg=BG,
+                               fg="#0A66C3", font=('Consolas', 10))
+        _folder_lbl.pack(side='left', padx=(6, 0))
+        self._events_folder_tip = Tooltip(_folder_lbl, "")
 
         # ── Row 1 sub-row B: queue/mask | force re-run/logs/player/synth/compare ─
         r1b = tk.Frame(left_section, bg=BG)
@@ -1636,28 +2097,47 @@ class StreakerDetectApp:
 
         btn_f2 = tk.Frame(r1b, bg=BG)
         btn_f2.pack(side='left', padx=4, pady=2)
-        tk.Button(btn_f2, text="📋 VIEW LOGS",
-                  command=self._show_logs_popup,
-                  bg='#443300', fg='white',
-                  font=('Arial', 9, 'bold'),
-                  relief='flat', padx=10, pady=3).pack(side='left', padx=2)
-        tk.Button(btn_f2, text="📺 PLAYER",
-                  command=self._launch_player,
-                  bg='#2a1a4a', fg='white',
-                  font=('Arial', 9, 'bold'),
-                  relief='flat', padx=10, pady=3,
-                  state='normal' if _PLAYER_AVAILABLE else 'disabled'
-                  ).pack(side='left', padx=2)
-        tk.Button(btn_f2, text="🧪 SYNTH TEST",
-                  command=self._launch_synth_test,
-                  bg='#1a3a1a', fg='white',
-                  font=('Arial', 9, 'bold'),
-                  relief='flat', padx=10, pady=3).pack(side='left', padx=2)
-        tk.Button(btn_f2, text="⚖ COMPARE",
-                  command=self._launch_compare,
-                  bg='#1a2a4a', fg='white',
-                  font=('Arial', 9, 'bold'),
-                  relief='flat', padx=10, pady=3).pack(side='left', padx=2)
+        _btn_logs = tk.Button(btn_f2, text="📋 VIEW LOGS",
+                              command=self._show_logs_popup,
+                              bg='#443300', fg='white',
+                              font=('Arial', 9, 'bold'),
+                              relief='flat', padx=10, pady=3)
+        _btn_logs.pack(side='left', padx=2)
+        Tooltip(_btn_logs, "View detection logs from previous runs — "
+                "shows what was found, frame counts, cloud stats, and any errors.")
+        _btn_player = tk.Button(btn_f2, text="📺 PLAYER",
+                                command=self._launch_player,
+                                bg='#2a1a4a', fg='white',
+                                font=('Arial', 9, 'bold'),
+                                relief='flat', padx=10, pady=3,
+                                state='normal' if _PLAYER_AVAILABLE else 'disabled')
+        _btn_player.pack(side='left', padx=2)
+        Tooltip(_btn_player, "Open the MKV timeline player to review full recording clips "
+                "with color-coded event markers (cyan=meteor, green=plane, magenta=satellite).")
+        _btn_synth = tk.Button(btn_f2, text="🧪 SYNTH TEST",
+                               command=self._launch_synth_test,
+                               bg='#1a3a1a', fg='white',
+                               font=('Arial', 9, 'bold'),
+                               relief='flat', padx=10, pady=3)
+        _btn_synth.pack(side='left', padx=2)
+        Tooltip(_btn_synth, "Run a synthetic test: injects a fake streak into a blank frame "
+                "to verify the current detection settings can find it.")
+        _btn_demo = tk.Button(btn_f2, text="🎛 DEMO",
+                              command=self._launch_demo,
+                              bg='#2a2a1a', fg='white',
+                              font=('Arial', 9, 'bold'),
+                              relief='flat', padx=10, pady=3)
+        _btn_demo.pack(side='left', padx=2)
+        Tooltip(_btn_demo, "Interactive filter demo: drag sliders and see in real-time "
+                "which synthetic objects (meteor, cloud, noise) pass or fail each filter.")
+        _btn_compare = tk.Button(btn_f2, text="⚖ COMPARE",
+                                 command=self._launch_compare,
+                                 bg='#1a2a4a', fg='white',
+                                 font=('Arial', 9, 'bold'),
+                                 relief='flat', padx=10, pady=3)
+        _btn_compare.pack(side='left', padx=2)
+        Tooltip(_btn_compare, "Side-by-side comparison of two detection runs — "
+                "useful for seeing how changing settings affects what gets detected.")
 
         self.stats_var = tk.StringVar(value="")
 
@@ -1672,14 +2152,32 @@ class StreakerDetectApp:
         row2.pack(fill='x', side='top')
 
         for args in [
-            ("MOG2 Thresh",  self.p_threshold,  10,  150,    1),
-            ("Min Area",     self.p_min_area,   10,  500,   10),
-            ("Max Area",     self.p_max_area,  500, 20000,  100),
-            ("Aspect Ratio", self.p_min_asp,   1.0,   8.0,  0.1),
-            ("Max Track Fr", self.p_max_track,   1,    30,    1),
-            ("Pre Buffer",   self.p_pre_buf,     5,   120,    5),
-            ("Post Buffer",  self.p_post_buf,    5,   120,    5),
-            ("Min Bright",   self.p_min_bright,  0,   255,    5),
+            ("MOG2 Thresh",   self.p_threshold,      10,  150,    1,
+             "Background sensitivity. Lower = more sensitive, more false positives. "
+             "Raise if stars or noise are triggering detections."),
+            ("Min Area",      self.p_min_area,        10,  500,   10,
+             "Minimum contour size in pixels² to be considered a detection. "
+             "Raise to ignore tiny noise specks."),
+            ("Max Area",      self.p_max_area,       500, 20000,  100,
+             "Maximum contour size in pixels². Detections larger than this are ignored. "
+             "Raise if large meteors are being missed."),
+            ("Aspect Ratio",  self.p_min_asp,        1.0,   8.0,  0.1,
+             "Minimum elongation of a detection (length ÷ width). "
+             "Higher values require streakier shapes, filtering out round blobs."),
+            ("Max Track Fr",  self.p_max_track,        1,    30,    1,
+             "How many frames a track can stay 'alive' without a new detection before it ends. "
+             "Higher values keep slow-moving objects tracked longer."),
+            ("Match Dist px", self.p_max_match_dist,   0,   200,    5,
+             "Fallback match distance in pixels. When two detections don't overlap at all, "
+             "they can still be linked as the same object if their centres are within this distance. "
+             "Set to 0 to disable. Useful for fast-moving planes and satellites."),
+            ("Pre Buffer",    self.p_pre_buf,           5,   120,    5,
+             "Frames to include BEFORE a detection fires. Captures the approach of the object."),
+            ("Post Buffer",   self.p_post_buf,          5,   120,    5,
+             "Frames to include AFTER the last detection. Captures the object leaving the frame."),
+            ("Min Bright",    self.p_min_bright,        0,   255,    5,
+             "Minimum peak pixel brightness for a detection to be saved. "
+             "Raise to filter out dim noise that passes shape filters."),
         ]:
             slider(row2, *args)
 
@@ -1688,13 +2186,27 @@ class StreakerDetectApp:
         row3.pack(fill='x', side='top')
 
         for args in [
-            ("Warmup Fr",    self.p_warmup,     50,   500,   50),
-            ("Cloud Sens",   self.p_cld_thr,    20,   200,    5),
-            ("Cloud Ratio",  self.p_cld_rat,  0.01,  0.50, 0.01),
-            ("Min Move px",  self.p_min_move,    0,    50,    1),
-            ("Min Travel px", self.p_min_travel,  0,   100,    5),
-            ("Stitch Gap",   self.p_stitch_gap,  0,  1000,   10),
-            ("Stitch Tol",   self.p_stitch_tol,  5,   300,    5),
+            ("Warmup Fr",     self.p_warmup,      50,   500,   50,
+             "Frames to skip at the start of each clip while the background model learns. "
+             "During warmup, detections are suppressed to avoid false triggers."),
+            ("Cloud Sens",    self.p_cld_thr,     20,   200,    5,
+             "Sensitivity of the cloud detector (sigma multiplier). "
+             "Lower = easier to declare a frame cloudy. Raise if clear-sky frames are being suppressed."),
+            ("Cloud Ratio",   self.p_cld_rat,   0.01,  0.50, 0.01,
+             "Fraction of active pixels that triggers cloud suppression. "
+             "e.g. 0.15 = suppress the frame if more than 15%% of pixels are 'active'."),
+            ("Min Move px",   self.p_min_move,     0,    50,    1,
+             "Minimum movement of a detection between frames to count as real. "
+             "Filters out stationary hot pixels."),
+            ("Min Travel px", self.p_min_travel,   0,   100,    5,
+             "Minimum total distance a track must travel (start to end) to be saved as an event. "
+             "Filters out flickering pixels that don't go anywhere."),
+            ("Stitch Gap",    self.p_stitch_gap,   0,  1000,   10,
+             "Maximum gap in frames between two clips to be stitched together into one event. "
+             "Set to 0 to disable stitching."),
+            ("Stitch Tol",    self.p_stitch_tol,   5,   300,    5,
+             "Maximum pixel distance between the end of one clip and the start of the next "
+             "for them to be considered the same object during stitching."),
         ]:
             slider(row3, *args)
 
@@ -1707,6 +2219,9 @@ class StreakerDetectApp:
                                   values=[1.0, 0.75, 0.5, 0.25],
                                   width=5, state='readonly')
         scale_menu.pack()
+        Tooltip(scale_menu, "Downscale frames before detection. "
+                "0.5 = half resolution, runs ~4× faster with slightly reduced sensitivity. "
+                "Use 1.0 for maximum accuracy on faint meteors.")
 
         # ── Row 4: adaptive cloud overrides ───────────────────────────────
         row4 = tk.Frame(left_section, bg=BG)
@@ -1716,8 +2231,12 @@ class StreakerDetectApp:
         tk.Label(row4, text="When ≥30% of recent frames are cloudy, override these filters:",
                  bg=BG, fg='#888888', font=('Arial', 7)).pack(side='left', padx=(0, 8))
         for args in [
-            ("Cloud Min Bright", self.p_cloud_min_bright, 0, 255, 5),
-            ("Cloud Min Travel", self.p_cloud_min_travel, 0, 100, 5),
+            ("Cloud Min Bright", self.p_cloud_min_bright, 0, 255, 5,
+             "When ≥30%% of recent frames are cloudy, override Min Bright with this value. "
+             "Set higher than normal Min Bright to reject dim cloud-lit false positives."),
+            ("Cloud Min Travel", self.p_cloud_min_travel, 0, 100, 5,
+             "When ≥30%% of recent frames are cloudy, override Min Travel with this value. "
+             "Set higher to require more movement before saving a cloudy-sky event."),
         ]:
             slider(row4, *args)
 
@@ -1727,6 +2246,9 @@ class StreakerDetectApp:
         self.progress_var = tk.DoubleVar(value=0)
         ttk.Progressbar(prog, variable=self.progress_var,
                         maximum=100).pack(fill='x', padx=6, pady=1)
+        self._active_folder_var = tk.StringVar(value="")
+        tk.Label(prog, textvariable=self._active_folder_var, bg='#0a0a0a',
+                 fg='#557799', font=('Consolas', 7), anchor='w').pack(fill='x', padx=6)
         self.progress_lbl = tk.StringVar(value="Ready")
         tk.Label(prog, textvariable=self.progress_lbl, bg='#0a0a0a',
                  fg='#aaaaaa', font=('Arial', 8)).pack()
@@ -1785,9 +2307,9 @@ class StreakerDetectApp:
                                            command=self._player_toggle_composite,
                                            bg='#252525', fg='#cccccc', relief='flat', padx=4)
         self._player_blend_btn.pack(side='left', padx=3)
-        self._player_tester_btn = tk.Button(ctrl_bar, text='🔬 Send to Tester',
-                                            command=self._player_send_to_tester,
-                                            bg='#3a1a5a', fg='white', relief='flat', padx=6)
+        self._player_tester_btn = tk.Button(ctrl_bar, text='📊 Send to Compare',
+                                            command=self._player_send_to_compare,
+                                            bg='#1a2a4a', fg='white', relief='flat', padx=6)
         self._player_tester_btn.pack(side='right', padx=6)
 
         scrub_row = tk.Frame(self._player_ctrl, bg=BP)
@@ -1887,7 +2409,8 @@ class StreakerDetectApp:
             'min_area':    self.p_min_area.get(),
             'max_area':    self.p_max_area.get(),
             'min_aspect':  self.p_min_asp.get(),
-            'max_track':   self.p_max_track.get(),
+            'max_track':      self.p_max_track.get(),
+            'max_match_dist': self.p_max_match_dist.get(),
             'pre_buffer':  self.p_pre_buf.get(),
             'post_buffer': self.p_post_buf.get(),
             'warmup':      self.p_warmup.get(),
@@ -1929,6 +2452,7 @@ class StreakerDetectApp:
         force = self.p_force_rerun.get()
 
         # Collect MKVs
+        # When forcing, delete checkpoint files so clips restart from frame 0
         if os.path.isdir(inp):
             if self._queue_listbox.size() > 0:
                 clips = [
@@ -1943,6 +2467,10 @@ class StreakerDetectApp:
             if force:
                 pending = clips
                 skipped = 0
+                for c in clips:
+                    cp = os.path.splitext(c)[0] + '.checkpoint'
+                    if os.path.exists(cp):
+                        os.remove(cp)
             else:
                 pending = [c for c in clips
                            if not os.path.exists(os.path.splitext(c)[0] + '.processed')]
@@ -1950,10 +2478,17 @@ class StreakerDetectApp:
         else:
             pending = [inp]
             skipped = 0
+            if force:
+                cp = os.path.splitext(inp)[0] + '.checkpoint'
+                if os.path.exists(cp):
+                    os.remove(cp)
 
         if not pending:
             messagebox.showinfo("All Done", "All clips in this folder are already processed.")
-            os.rmdir(run_dir)  # nothing to do — remove empty run folder
+            try:
+                os.rmdir(run_dir)  # remove only if truly empty
+            except OSError:
+                pass
             return
 
         self._player_stop_loop()
@@ -1974,12 +2509,14 @@ class StreakerDetectApp:
         if force:
             lbl += " (force re-run)"
         self.progress_lbl.set(lbl)
+        self._active_folder_var.set(run_dir)
         self.run_btn.config(state='disabled')
         self.stop_btn.config(state='normal')
         self._run_next_batch(run_dir)
 
     def _stop_detection(self):
         self.stop_event.set()
+        self._identify_cancel.set()
         worker = getattr(self, '_current_worker', None)
         if worker:
             proc = getattr(worker, '_ffmpeg_proc', None)
@@ -1988,6 +2525,7 @@ class StreakerDetectApp:
         self.run_btn.config(state='normal')
         self.stop_btn.config(state='disabled')
         self.progress_lbl.set("Stopped.")
+        self._active_folder_var.set("")
         self.root.title(f"StreakerDetect  v{VERSION}")
 
     # --------------------------------------------------------------------------
@@ -2010,7 +2548,10 @@ class StreakerDetectApp:
             try:
                 while True:
                     ev = self.event_q.get_nowait()
-                    self.thumb_panel.add_event(ev)
+                    if 'warning' in ev:
+                        self.progress_lbl.set(f"⚠ {ev['warning']}")
+                    else:
+                        self.thumb_panel.add_event(ev)
             except queue.Empty:
                 pass
 
@@ -2021,6 +2562,17 @@ class StreakerDetectApp:
                     n = result['_stitch_result']
                     self.progress_lbl.set(
                         f"Stitch complete — {n} event(s) merged")
+                    if result.get('_then_ufo'):
+                        self._show_ufo()
+                elif result.get('_identify_done'):
+                    self._btn_identify.config(state='normal')
+                    if 'error' in result:
+                        messagebox.showerror("Identify Error", result['error'])
+                        self.progress_lbl.set("Identify failed.")
+                    elif self._identify_cancel.is_set():
+                        self.progress_lbl.set("Identification cancelled.")
+                    else:
+                        self.progress_lbl.set("Identification complete.")
                 else:
                     self._on_done(result)
             except queue.Empty:
@@ -2031,7 +2583,7 @@ class StreakerDetectApp:
             msg = traceback.format_exc()
             print(msg)
             try:
-                log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'streaker_error.log')
+                log_path = os.path.join(_BASE_DIR, 'streaker_error.log')
                 with open(log_path, 'a') as f:
                     f.write(f'\n--- {datetime.now()} [poll] ---\n{msg}')
             except Exception:
@@ -2090,7 +2642,7 @@ class StreakerDetectApp:
         if 'error' in result:
             trace = result.get('trace', result['error'])
             try:
-                log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'streaker_error.log')
+                log_path = os.path.join(_BASE_DIR, 'streaker_error.log')
                 with open(log_path, 'a') as f:
                     f.write(f'\n--- {datetime.now()} [worker] ---\n{trace}')
             except Exception:
@@ -2290,18 +2842,33 @@ class StreakerDetectApp:
         if not _PLAYER_AVAILABLE:
             messagebox.showerror("Player Unavailable", "StreakerPlayer.py not found.")
             return
-        folder = getattr(self, '_current_run_dir', None) or self.output_dir.get() or None
+        # Prefer the MKV of the currently previewed event clip
+        mkv = getattr(self, '_player_mkv_path', None)
+        print(f"[PLAYER] _player_mkv_path={mkv!r}  exists={mkv and os.path.isfile(mkv)}")
+        if mkv and os.path.isfile(mkv):
+            launch_player(mkv_path=mkv)
+            return
+        # Fall back to current run/detect folder
+        folder = getattr(self, '_current_run_dir', None)
+        print(f"[PLAYER] falling back to folder={folder!r}")
+        if not folder or not os.path.isdir(folder):
+            initial = self.output_dir.get() or None
+            folder = filedialog.askdirectory(
+                title="Select detect folder to open in Player",
+                initialdir=initial)
+            if not folder:
+                return
         launch_player(initial_folder=folder)
 
     def _launch_synth_test(self):
-        synth_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'synth_test.py')
+        synth_path = find_companion_script('synth_test.py')
         if not os.path.exists(synth_path):
             messagebox.showerror("Not Found", f"synth_test.py not found at:\n{synth_path}")
             return
         # Pre-fill source and output from current UI state
         src    = self.input_path.get().strip()
         outdir = self.output_dir.get().strip()
-        cmd = [sys.executable, synth_path]
+        cmd = [PYTHON_EXE, synth_path]
         if src:
             cmd += ['--presource', src]
         if outdir:
@@ -2316,7 +2883,7 @@ class StreakerDetectApp:
                 req = urllib.request.Request(url, headers={'User-Agent': 'StreakerDetect'})
                 with urllib.request.urlopen(req, timeout=8) as resp:
                     data = json.loads(resp.read())
-                tag = data.get('tag_name', '').lstrip('v')
+                tag = data.get('tag_name', '').lstrip('v.')
                 if not tag or tag == VERSION:
                     return
                 assets = data.get('assets', [])
@@ -2367,13 +2934,20 @@ class StreakerDetectApp:
                 ))
         threading.Thread(target=_download, daemon=True).start()
 
+    def _launch_demo(self):
+        demo_path = find_companion_script('StreakerDemo.py')
+        if not os.path.exists(demo_path):
+            messagebox.showerror("Not Found", f"StreakerDemo.py not found at:\n{demo_path}")
+            return
+        subprocess.Popen([PYTHON_EXE, demo_path], creationflags=NO_WINDOW)
+
     def _launch_compare(self):
-        compare_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'StreakerCompare.py')
+        compare_path = find_companion_script('StreakerCompare.py')
         if not os.path.exists(compare_path):
             messagebox.showerror("Not Found", f"StreakerCompare.py not found at:\n{compare_path}")
             return
         src = self.input_path.get().strip()
-        cmd = [sys.executable, compare_path]
+        cmd = [PYTHON_EXE, compare_path]
         if src:
             cmd += ['--source', src]
         subprocess.Popen(cmd, creationflags=NO_WINDOW)
@@ -2387,12 +2961,15 @@ class StreakerDetectApp:
     def _open_events_folder_path(self, folder):
         if not folder or not os.path.isdir(folder):
             return
+        folder = os.path.normpath(folder)
+        self._events_folder_var.set(os.path.basename(folder))
+        self._events_folder_tip._text = folder
 
         entries = os.listdir(folder)
 
         # First look for event_ folders directly in this folder
         event_dirs = sorted(
-            os.path.join(folder, d) for d in entries
+            os.path.normpath(os.path.join(folder, d)) for d in entries
             if d.startswith('event_') and os.path.isdir(os.path.join(folder, d)))
         source_label = os.path.basename(folder)
 
@@ -2400,9 +2977,9 @@ class StreakerDetectApp:
             # No direct events — search one level deeper in every subfolder
             sub_dirs = sorted(d for d in entries if os.path.isdir(os.path.join(folder, d)))
             for sd in sub_dirs:
-                sd_path = os.path.join(folder, sd)
+                sd_path = os.path.normpath(os.path.join(folder, sd))
                 event_dirs += sorted(
-                    os.path.join(sd_path, d) for d in os.listdir(sd_path)
+                    os.path.normpath(os.path.join(sd_path, d)) for d in os.listdir(sd_path)
                     if d.startswith('event_') and os.path.isdir(os.path.join(sd_path, d)))
             if event_dirs:
                 source_label = f"{os.path.basename(folder)} ({len(sub_dirs)} subfolders)"
@@ -2411,52 +2988,90 @@ class StreakerDetectApp:
             messagebox.showinfo("No Events", "No event_ subfolders found in that folder.")
             return
 
-        # Clear existing thumbnails
         self.thumb_panel.clear()
+        self.progress_lbl.set(f"Loading {len(event_dirs)} events…")
 
-        for event_dir in event_dirs:
-            thumb_path = os.path.join(event_dir, '_thumbnail.jpg')
-            clip_path  = os.path.join(event_dir, 'clip.mkv')
-            frame_files = [f for f in os.listdir(event_dir)
-                           if f.startswith('frame_') and f.endswith('.jpg')]
+        total  = len(event_dirs)
+        _label = source_label
+        _q     = queue.Queue()
 
-            if os.path.exists(clip_path):
-                cap = cv2.VideoCapture(clip_path)
-                n_frames = max(0, int(cap.get(cv2.CAP_PROP_FRAME_COUNT)))
-                # Regenerate thumbnail from MKV if missing
+        def _load_events():
+            for event_dir in event_dirs:
+                thumb_path  = os.path.join(event_dir, '_thumbnail.jpg')
+                clip_path   = os.path.join(event_dir, 'clip.mkv')
+                meta_path   = os.path.join(event_dir, 'metadata.json')
+                frame_files = []
+
+                n_frames = 0
+                if os.path.exists(meta_path):
+                    try:
+                        with open(meta_path) as f:
+                            meta = json.load(f)
+                        n_frames = meta.get('end_frame', 0) - meta.get('start_frame', 0)
+                    except Exception:
+                        pass
+
+                if n_frames == 0:
+                    if os.path.exists(clip_path):
+                        cap = cv2.VideoCapture(clip_path)
+                        n_frames = max(0, int(cap.get(cv2.CAP_PROP_FRAME_COUNT)))
+                        cap.release()
+                    else:
+                        frame_files = [f for f in os.listdir(event_dir)
+                                       if f.startswith('frame_') and f.endswith('.jpg')]
+                        n_frames = len(frame_files)
+
                 if not os.path.exists(thumb_path):
-                    grays = []
-                    while True:
-                        ret, frame = cap.read()
-                        if not ret:
-                            break
-                        grays.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
-                    thumb_bgr = make_thumbnail(grays)
-                    if thumb_bgr is not None:
-                        cv2.imwrite(thumb_path, thumb_bgr)
-                cap.release()
-            else:
-                n_frames = len(frame_files)
-                # Regenerate thumbnail from JPEGs if missing
-                if not os.path.exists(thumb_path) and frame_files:
-                    grays = [cv2.imread(os.path.join(event_dir, f), cv2.IMREAD_GRAYSCALE)
-                             for f in sorted(frame_files)]
-                    grays = [g for g in grays if g is not None]
-                    thumb_bgr = make_thumbnail(grays)
-                    if thumb_bgr is not None:
-                        cv2.imwrite(thumb_path, thumb_bgr)
+                    if os.path.exists(clip_path):
+                        cap = cv2.VideoCapture(clip_path)
+                        grays = []
+                        while True:
+                            ret, frame = cap.read()
+                            if not ret:
+                                break
+                            grays.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+                        cap.release()
+                        thumb_bgr = make_thumbnail(grays)
+                        if thumb_bgr is not None:
+                            cv2.imwrite(thumb_path, thumb_bgr)
+                    else:
+                        if not frame_files:
+                            frame_files = [f for f in os.listdir(event_dir)
+                                           if f.startswith('frame_') and f.endswith('.jpg')]
+                        grays = [cv2.imread(os.path.join(event_dir, f), cv2.IMREAD_GRAYSCALE)
+                                 for f in sorted(frame_files)]
+                        grays = [g for g in grays if g is not None]
+                        thumb_bgr = make_thumbnail(grays)
+                        if thumb_bgr is not None:
+                            cv2.imwrite(thumb_path, thumb_bgr)
 
-            self.thumb_panel.add_event({
-                'dir':    event_dir,
-                'thumb':  thumb_path,
-                'frames': n_frames,
-                'count':  0,
-            })
+                _q.put({'dir': event_dir, 'thumb': thumb_path,
+                        'frames': n_frames, 'count': 0})
+            _q.put(None)  # sentinel
 
-        self.progress_lbl.set(f"Loaded {len(event_dirs)} events from {source_label}")
+        def _drain():
+            BATCH = 25
+            added = 0
+            try:
+                for _ in range(BATCH):
+                    ev = _q.get_nowait()
+                    if ev is None:
+                        self.progress_lbl.set(f"Loaded {total} events from {_label}")
+                        return
+                    self.thumb_panel.add_event(ev)
+                    added += 1
+            except queue.Empty:
+                pass
+            if added:
+                done = len(self.thumb_panel.all_events)
+                self.progress_lbl.set(f"Loading… {done}/{total}")
+            self.root.after(30, _drain)
+
+        threading.Thread(target=_load_events, daemon=True).start()
+        self.root.after(30, _drain)
 
     def _open_event_viewer(self, event_dir):
-        self._load_event(event_dir)
+        self._load_event(os.path.normpath(event_dir))
 
     # --------------------------------------------------------------------------
     # Embedded Player
@@ -2471,8 +3086,21 @@ class StreakerDetectApp:
 
         if use_mkv:
             cap = cv2.VideoCapture(clip_path)
-            n_frames = max(1, int(cap.get(cv2.CAP_PROP_FRAME_COUNT)))
+            n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             cap.release()
+            # CAP_PROP_FRAME_COUNT is unreliable for H.264 MKV — fall back to metadata
+            if n_frames <= 1:
+                try:
+                    meta_path = os.path.join(event_dir, 'metadata.json')
+                    with open(meta_path) as f:
+                        _m = json.load(f)
+                    n_meta = (_m.get('n_frames') or
+                              int(_m.get('end_frame', 0)) - int(_m.get('start_frame', 0)) + 1)
+                    if n_meta > 1:
+                        n_frames = n_meta
+                except Exception:
+                    pass
+            n_frames = max(1, n_frames)
         else:
             n_frames = len(frame_paths)
 
@@ -2578,7 +3206,7 @@ class StreakerDetectApp:
             self._player_ctrl.pack(fill='x')
 
         self._player_scrubbing = True
-        self._player_scrubber.config(to=max(1, len(frame_paths) - 1))
+        self._player_scrubber.config(to=max(1, len(self._player_frames) - 1))
         self._player_scrubber.set(0)
         self._player_scrubbing = False
 
@@ -2709,14 +3337,41 @@ class StreakerDetectApp:
         if 0 <= idx < len(events) - 1:
             self._load_event(events[idx + 1]['dir'])
 
-    def _player_send_to_tester(self):
-        if not self._player_tester_clip or not os.path.isfile(self._player_tester_clip):
+    def _player_send_to_compare(self):
+        compare_py = find_companion_script('StreakerCompare.py')
+        event_dir  = self._player_event_dir
+
+        # Try to open the source MKV with a pre-roll window around the event
+        source_mkv = None
+        start_sec  = 0.0
+        duration   = 300.0  # default 5 minutes
+        pre_roll   = 180.0  # 3 minutes before event so MOG2 can warm up
+
+        if event_dir and os.path.isdir(event_dir):
+            meta_path = os.path.join(event_dir, 'metadata.json')
+            if os.path.exists(meta_path):
+                try:
+                    with open(meta_path) as f:
+                        meta = json.load(f)
+                    src = meta.get('source_clip', '')
+                    if src and os.path.isfile(src):
+                        source_mkv = src
+                        fps = float(meta.get('fps', 20))
+                        event_sec = meta.get('start_frame', 0) / max(fps, 1)
+                        start_sec = max(0.0, event_sec - pre_roll)
+                except Exception:
+                    pass
+
+        if not source_mkv:
+            messagebox.showwarning('No source MKV',
+                'Could not locate the source recording MKV for this event.\n'
+                'Open StreakerCompare manually and select the MKV file.')
             return
-        synth_py    = os.path.join(os.path.dirname(__file__), 'synth_test.py')
-        output_root = self.output_dir.get().strip() or os.path.dirname(__file__)
-        subprocess.Popen([sys.executable, synth_py,
-                          '--presource', self._player_tester_clip,
-                          '--preoutput', output_root],
+
+        subprocess.Popen([PYTHON_EXE, compare_py,
+                          '--source',   source_mkv,
+                          '--start',    str(int(start_sec)),
+                          '--duration', str(int(duration))],
                          creationflags=NO_WINDOW)
 
     def _player_auto_cut(self, event_dir):
@@ -2747,8 +3402,8 @@ class StreakerDetectApp:
             if out_path:
                 self._player_tester_clip = out_path
                 self._player_tester_btn.config(
-                    text='🔬 Send to Tester', state='normal', bg='#3a1a5a',
-                    command=self._player_send_to_tester)
+                    text='📊 Send to Compare', state='normal', bg='#1a2a4a',
+                    command=self._player_send_to_compare)
             else:
                 self._player_tester_btn.config(
                     text='✂ Cut failed', state='disabled', bg='#3a1a1a')
@@ -2775,8 +3430,8 @@ class StreakerDetectApp:
             if out_path:
                 self._player_tester_clip = out_path
                 self._player_tester_btn.config(
-                    text='🔬 Send to Tester', state='normal', bg='#3a1a5a',
-                    command=self._player_send_to_tester)
+                    text='📊 Send to Compare', state='normal', bg='#1a2a4a',
+                    command=self._player_send_to_compare)
             else:
                 self._player_tester_btn.config(
                     text='✂ Cut failed', state='disabled', bg='#3a1a1a')
@@ -2819,22 +3474,128 @@ class StreakerDetectApp:
         ok = subprocess.run(cmd, capture_output=True, creationflags=NO_WINDOW).returncode == 0
         return out_path if ok and os.path.isfile(out_path) else None
 
+    def _has_events(self, d):
+        """True if d contains at least one event_* subdir with metadata.json."""
+        try:
+            return any(
+                os.path.exists(os.path.join(d, sub, 'metadata.json'))
+                for sub in os.listdir(d)
+                if sub.startswith('event_') and os.path.isdir(os.path.join(d, sub)))
+        except OSError:
+            return False
+
     def _run_stitcher(self):
-        folder = filedialog.askdirectory(title="Select Events Folder to Stitch")
+        folder = filedialog.askdirectory(
+            title="Select events folder (or date folder containing several runs) to Stitch")
         if not folder:
             return
-        self.progress_lbl.set("Stitching events...")
-        self.root.update()
+
+        if self._has_events(folder):
+            run_folders = [folder]
+        else:
+            run_folders = sorted([
+                os.path.join(folder, d) for d in os.listdir(folder)
+                if os.path.isdir(os.path.join(folder, d))
+                and self._has_events(os.path.join(folder, d))])
+            if not run_folders:
+                messagebox.showinfo("No Events",
+                    "No event_ subfolders found in the selected folder or its subdirectories.")
+                return
+
+        self.progress_lbl.set(f"Stitching {len(run_folders)} folder(s)…")
 
         def do_stitch():
+            total = 0
+            for run_dir in run_folders:
+                stitcher = EventStitcher(
+                    run_dir,
+                    max_gap_frames=self.p_stitch_gap.get(),
+                    position_tolerance=self.p_stitch_tol.get())
+                total += stitcher.run()
+            self.done_q.put({'_stitch_result': total, 'folder': folder})
+
+        threading.Thread(target=do_stitch, daemon=True).start()
+
+    def _auto_stitch_then_ufo(self, run_dir):
+        self.progress_lbl.set("Auto-stitching events…")
+
+        def _do():
             stitcher = EventStitcher(
-                folder,
+                run_dir,
                 max_gap_frames=self.p_stitch_gap.get(),
                 position_tolerance=self.p_stitch_tol.get())
             n = stitcher.run()
-            self.done_q.put({'_stitch_result': n, 'folder': folder})
+            self.done_q.put({'_stitch_result': n, 'folder': run_dir, '_then_ufo': True})
 
-        threading.Thread(target=do_stitch, daemon=True).start()
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _run_identify(self):
+        folder = filedialog.askdirectory(
+            title="Select detect run folder (or date folder containing several runs)",
+            initialdir=self.output_dir.get() or None)
+        if not folder:
+            return
+
+        try:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location(
+                'StreakerIdentify',
+                os.path.join(_BASE_DIR, 'StreakerIdentify.py'))
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+        except Exception as e:
+            messagebox.showerror("Identify Error",
+                                 f"Could not load StreakerIdentify.py:\n{e}")
+            return
+
+        # Determine which folders to process:
+        #  • folder itself has events → process just it
+        #  • folder contains subdirs with events → process each subdir (date folder)
+        if self._has_events(folder):
+            run_folders = [folder]
+        else:
+            run_folders = sorted([
+                os.path.join(folder, d) for d in os.listdir(folder)
+                if os.path.isdir(os.path.join(folder, d))
+                and self._has_events(os.path.join(folder, d))])
+            if not run_folders:
+                messagebox.showinfo("No Events",
+                    "No event_ subfolders found in the selected folder or its subdirectories.")
+                return
+
+        self.progress_lbl.set(
+            f"Identifying {len(run_folders)} run folder(s)…")
+
+        self._identify_cancel.clear()
+        self._btn_identify.config(state='disabled')
+
+        def _do():
+            try:
+                config = mod._load_config()
+                calib  = mod._load_calib(config)
+                tle    = mod._find_tle(config)
+                lines  = []
+
+                def _log(msg):
+                    lines.append(msg)
+                    self.root.after(0, lambda m=msg: self.progress_lbl.set(m))
+
+                for i, run_dir in enumerate(run_folders, 1):
+                    if self._identify_cancel.is_set():
+                        break
+                    _log(f'[{i}/{len(run_folders)}] {os.path.basename(run_dir)}')
+                    mod.identify_folder(run_dir, config, calib, tle,
+                                        progress_cb=_log,
+                                        cancel_event=self._identify_cancel)
+                summary = '\n'.join(lines[-10:])
+                self.done_q.put({'_identify_done': True, 'summary': summary})
+            except Exception as e:
+                import traceback
+                self.done_q.put({'_identify_done': True,
+                                 'error': f'{e}\n{traceback.format_exc()}'})
+
+        threading.Thread(target=_do, daemon=True).start()
+
 
     # --------------------------------------------------------------------------
     # Batch Processing
@@ -2889,7 +3650,10 @@ class StreakerDetectApp:
             self.run_btn.config(state='normal')
             self.stop_btn.config(state='disabled')
             if not self.stop_event.is_set():
-                self._show_ufo()
+                if self.p_auto_stitch.get() and out and os.path.isdir(out):
+                    self._auto_stitch_then_ufo(out)
+                else:
+                    self._show_ufo()
             return
 
         clip = self._batch_queue.pop(0)
@@ -2905,6 +3669,12 @@ class StreakerDetectApp:
         while not self.event_q.empty():   self.event_q.get_nowait()
         while not self.done_q.empty():    self.done_q.get_nowait()
 
+        # Release previous worker's MOG2 model and frame buffers before starting next clip
+        if hasattr(self, 'worker_thread') and self.worker_thread is not None:
+            self.worker_thread.join(timeout=5)
+        self._current_worker = None
+        gc.collect()
+
         worker = DetectionWorker(
             input_path=clip,
             mask_path=self.mask_path.get().strip() or None,
@@ -2914,6 +3684,7 @@ class StreakerDetectApp:
             event_q=self.event_q,
             done_q=self.done_q,
             stop_event=self.stop_event,
+            sw_decode=self.p_no_hwaccel.get(),
         )
         self._current_worker = worker
         self.worker_thread = threading.Thread(target=worker.run, daemon=True)
