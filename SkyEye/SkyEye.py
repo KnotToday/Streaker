@@ -9,7 +9,6 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
 import cv2
-import numpy as np
 from PIL import Image, ImageTk
 
 VERSION = "0.2.0"
@@ -18,16 +17,17 @@ VERSION = "0.2.0"
 # Paths
 # ---------------------------------------------------------------------------
 if getattr(sys, 'frozen', False):
-    _BASE = Path(os.path.dirname(sys.executable))
+    _BASE = Path(os.path.dirname(sys.executable))  # SkyEye/dist/
+    _REPO = _BASE.parent.parent                     # SkyEye/dist/ → SkyEye/ → Streaker/
 else:
-    _BASE = Path(__file__).parent.resolve()
+    _BASE = Path(__file__).parent.resolve()         # SkyEye/
+    _REPO = _BASE.parent                            # SkyEye/ → Streaker/
 
 _CONFIG_PATH  = _BASE / "shared_config.json"
 _EXAMPLE_PATH = _BASE / "shared_config.example.json"
 _CAMERAS_PATH = _BASE / "cameras.json"
 
 # Sibling apps live next to SkyEye/ inside the Streaker repo
-_REPO = _BASE.parent
 _STREAKER_DETECT_DIR = _REPO / "Streaker Detect"
 _STREAKER_DETECT_EXE = _STREAKER_DETECT_DIR / "dist" / "StreakerDetect.exe"
 _STREAKER_DETECT_PY  = _STREAKER_DETECT_DIR / "StreakerDetect.py"
