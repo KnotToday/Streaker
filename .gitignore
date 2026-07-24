@@ -6,6 +6,7 @@
 !/Record/
 !/Sat_Calcs/
 !/Streaker_Display/
+!/SkyEye/
 
 # Streaker Detect — exclude build artifacts and generated output
 /Streaker Detect/build/
@@ -49,3 +50,12 @@
 /Streaker_Display/__pycache__/
 /Streaker_Display/*.pyc
 /Streaker_Display/*.log
+
+# SkyEye — exclude credentials, camera profiles, and build artifacts
+/SkyEye/shared_config.json
+/SkyEye/cameras.json
+/SkyEye/build/
+/SkyEye/dist/
+/SkyEye/__pycache__/
+/SkyEye/*.pyc
+/SkyEye/*.log
