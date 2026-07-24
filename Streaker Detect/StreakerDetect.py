@@ -2292,6 +2292,23 @@ class StreakerDetectApp:
         _btn_compare.pack(side='left', padx=2)
         Tooltip(_btn_compare, "Side-by-side comparison of two detection runs — "
                 "useful for seeing how changing settings affects what gets detected.")
+        tk.Label(btn_f2, text="│", bg=BG, fg='#444').pack(side='left', padx=4)
+        _btn_sync = tk.Button(btn_f2, text="📡 SYNC",
+                              command=self._launch_sync,
+                              bg='#1a3a4a', fg='#88ddff',
+                              font=('Arial', 9, 'bold'),
+                              relief='flat', padx=10, pady=3)
+        _btn_sync.pack(side='left', padx=2)
+        Tooltip(_btn_sync, "StreakerSync — scrub each camera to a GPS clock reference "
+                "frame and enter the UTC time shown, for post-hoc multi-camera alignment.")
+        _btn_match = tk.Button(btn_f2, text="🔗 MATCH",
+                               command=self._launch_match,
+                               bg='#1a3a4a', fg='#88ddff',
+                               font=('Arial', 9, 'bold'),
+                               relief='flat', padx=10, pady=3)
+        _btn_match.pack(side='left', padx=2)
+        Tooltip(_btn_match, "StreakerMatch — compare events across cameras and group "
+                "ones that occurred at the same time for triangulation.")
 
         self.stats_var = tk.StringVar(value="")
 
@@ -3238,6 +3255,12 @@ class StreakerDetectApp:
         src   = self.input_path.get().strip()
         extra = ['--source', src] if src else []
         launch_companion('StreakerCompare.py', extra)
+
+    def _launch_sync(self):
+        launch_companion('StreakerSync.py')
+
+    def _launch_match(self):
+        launch_companion('StreakerMatch.py')
 
     def _open_mask_editor(self):
         try:
