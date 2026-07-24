@@ -5,7 +5,7 @@ a = Analysis(
     ['Streaker_Record_Launch.py'],
     pathex=[],
     binaries=[
-        (r'C:\Program Files\FFMPEG\ffmpeg-2024-03-04-git-e30369bc1c-full_build\bin\ffmpeg.exe', '.'),
+        (r'bin\ffmpeg.exe', '.'),
     ],
     datas=[],
     hiddenimports=[],

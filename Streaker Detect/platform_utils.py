@@ -7,18 +7,20 @@ import subprocess
 
 
 def find_ffmpeg():
-    """Discover ffmpeg: bundled exe → FFMPEG_PATH env var → system PATH → known Windows location."""
+    """Discover ffmpeg: bundled exe → local bin/ → FFMPEG_PATH env var → known Windows location → system PATH."""
     # PyInstaller bundle: ffmpeg.exe is extracted alongside the app at runtime
     if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
         bundled = os.path.join(sys._MEIPASS, 'ffmpeg.exe')
         if os.path.isfile(bundled):
             return bundled
+    # bin/ subfolder next to this file (used when running from source)
+    here = os.path.dirname(os.path.abspath(__file__))
+    local_bin = os.path.join(here, 'bin', 'ffmpeg.exe')
+    if os.path.isfile(local_bin):
+        return local_bin
     env = os.environ.get('FFMPEG_PATH') or os.environ.get('FFMPEG')
     if env and os.path.isfile(env):
         return env
-    found = shutil.which('ffmpeg')
-    if found:
-        return found
     if sys.platform == 'win32':
         fallback = (
             r"C:\Program Files\FFMPEG"
@@ -76,9 +78,7 @@ def play_completion_sound():
 
 def find_python():
     """Return a real Python interpreter path, even when running as a frozen exe."""
-    if not getattr(sys, 'frozen', False):
-        return sys.executable
-    # Prefer Environ1 venv — project dependencies (astropy, cv2, etc.) live there
+    # Always prefer Environ1 venv — project dependencies (astropy, cv2, etc.) live there
     environ1 = os.path.join(os.path.expanduser('~'),
                             'PythonTrials', 'Environ1', 'Scripts', 'python.exe')
     if os.path.isfile(environ1):
@@ -120,6 +120,35 @@ def find_companion_script(script_name):
         return os.path.join(sys._MEIPASS, script_name)
     here = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(here, script_name)
+
+
+def launch_companion(script_name, extra_args=None):
+    """Launch a companion script as a no-console subprocess.
+
+    Frozen exe: re-invokes sys.executable with --companion <script_name>.
+    Development: runs the .py file with PYTHON_EXE.
+    Either way there is no console window and the child inherits a clean env.
+    """
+    extra = extra_args or []
+    if getattr(sys, 'frozen', False):
+        cmd = [sys.executable, '--companion', script_name] + extra
+    else:
+        cmd = [PYTHON_EXE, find_companion_script(script_name)] + extra
+    return subprocess.Popen(cmd, creationflags=NO_WINDOW, env=clean_env())
+
+
+def clean_env():
+    """Return an environment dict safe for launching a standalone Python GUI subprocess.
+
+    When running as a PyInstaller frozen exe the bootloader injects TCL_LIBRARY,
+    TK_LIBRARY, PYTHONPATH, and PYTHONHOME pointing at the _MEI* temp dir.
+    Child processes inherit those, which breaks tkinter in the child.  Strip them.
+    """
+    env = os.environ.copy()
+    for key in ('TCL_LIBRARY', 'TK_LIBRARY', 'TK_DATA', 'TCL_DATA',
+                'PYTHONPATH', 'PYTHONHOME'):
+        env.pop(key, None)
+    return env
 
 
 FFMPEG_PATH = find_ffmpeg()

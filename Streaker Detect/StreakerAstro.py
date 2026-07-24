@@ -13,6 +13,12 @@ from tkinter import filedialog, messagebox
 from pathlib import Path
 
 try:
+    from StreakerLocalSolve import LocalSolveWindow
+    _LOCAL_SOLVE = True
+except ImportError:
+    _LOCAL_SOLVE = False
+
+try:
     import requests
     HAS_REQUESTS = True
 except ImportError:
@@ -26,7 +32,17 @@ except ImportError:
     HAS_ASTROPY = False
 
 ASTROMETRY_URL = "https://nova.astrometry.net/api"
-CONFIG_PATH = Path(__file__).parent / "streaker_astro_config.json"
+import sys as _sys
+def _config_path():
+    # Prefer --config-dir arg (passed by StreakerPlayer when launching as subprocess)
+    for i, arg in enumerate(_sys.argv[1:], 1):
+        if arg == '--config-dir' and i < len(_sys.argv):
+            return Path(_sys.argv[i + 1]) / "streaker_astro_config.json"
+    if getattr(_sys, 'frozen', False):
+        return Path(_sys.executable).parent / "streaker_astro_config.json"
+    return Path(__file__).parent / "streaker_astro_config.json"
+
+CONFIG_PATH = _config_path()
 
 BG       = '#1a1a2e'
 FG       = '#e0e0e0'
@@ -93,14 +109,19 @@ class StreakerAstro:
         self.root.resizable(True, False)
 
         self.cfg        = _load_config()
-        self.stack_path = stack_path
+        # Prefer contrast image saved by Local Solve over raw stack
+        contrast_img = self.cfg.get('last_contrast_image', '')
+        if contrast_img and os.path.isfile(contrast_img):
+            self.stack_path = contrast_img
+        else:
+            self.stack_path = stack_path
         self.event_dir  = event_dir
         self._wcs_path  = None
 
         self._build_ui()
 
-        if stack_path:
-            self.stack_lbl.config(text=str(stack_path), fg=FG)
+        if self.stack_path:
+            self.stack_lbl.config(text=str(self.stack_path), fg=FG)
         if event_dir:
             self.event_lbl.config(text=os.path.basename(str(event_dir)), fg=FG)
 
@@ -146,6 +167,23 @@ class StreakerAstro:
         tk.Button(row3, text="Browse…", command=self._browse_event,
                   bg='#334455', fg='white', relief='flat', padx=6).pack(side='right')
 
+        # ── Mask file ─────────────────────────────────────────────────
+        row_mask = tk.Frame(self.root, bg=BG)
+        row_mask.pack(fill='x', **pad)
+        tk.Label(row_mask, text="Mask:", bg=BG, fg=FG,
+                 font=('Arial', 9), width=10, anchor='w').pack(side='left')
+        self.mask_path = self.cfg.get('mask_path', '')
+        self.mask_lbl = tk.Label(row_mask,
+                                 text=os.path.basename(self.mask_path) if self.mask_path else "None (optional)",
+                                 bg=BG, fg=FG if self.mask_path else '#666666',
+                                 font=('Arial', 8), anchor='w')
+        self.mask_lbl.pack(side='left', padx=4, fill='x', expand=True)
+        tk.Button(row_mask, text="Clear",
+                  command=self._clear_mask,
+                  bg='#443333', fg='white', relief='flat', padx=6).pack(side='right', padx=(2, 0))
+        tk.Button(row_mask, text="Browse…", command=self._browse_mask,
+                  bg='#334455', fg='white', relief='flat', padx=6).pack(side='right')
+
         # ── Sky center hint ───────────────────────────────────────────
         center_row = tk.Frame(self.root, bg=BG)
         center_row.pack(fill='x', padx=14, pady=(2, 0))
@@ -175,7 +213,7 @@ class StreakerAstro:
         fov_row.pack(fill='x', padx=14, pady=(2, 0))
         tk.Label(fov_row, text="FOV width (°):", bg=BG, fg=FG,
                  font=('Arial', 9), width=14, anchor='w').pack(side='left')
-        self.fov_var = tk.StringVar(value=self.cfg.get('fov_deg', ''))
+        self.fov_var = tk.StringVar(value=self.cfg.get('fov_deg', '90'))
         tk.Entry(fov_row, textvariable=self.fov_var, width=8,
                  bg=ENTRY_BG, fg=FG, insertbackground=FG,
                  relief='flat').pack(side='left', padx=4)
@@ -185,7 +223,7 @@ class StreakerAstro:
         # ── Stretch option ────────────────────────────────────────────
         stretch_row = tk.Frame(self.root, bg=BG)
         stretch_row.pack(fill='x', padx=14, pady=(2, 0))
-        self.stretch_var = tk.StringVar(value=self.cfg.get('stretch_mode', 'blackpoint'))
+        self.stretch_var = tk.StringVar(value='none')
         tk.Label(stretch_row, text="Stretch:", bg=BG, fg=FG,
                  font=('Arial', 9), width=14, anchor='w').pack(side='left')
         tk.Radiobutton(stretch_row, text="Black point clip",
@@ -239,7 +277,12 @@ class StreakerAstro:
         tk.Button(btn_row, text="📏 Manual Calibrate",
                   command=self._manual_calibrate,
                   bg='#2a3a1a', fg='white', relief='flat',
-                  font=('Arial', 10), pady=6).pack(side='left')
+                  font=('Arial', 10), pady=6).pack(side='left', padx=(0, 8))
+        tk.Button(btn_row, text="🌟 Local Solve",
+                  command=self._local_solve,
+                  bg='#3a2a1a', fg='white', relief='flat',
+                  font=('Arial', 10), pady=6,
+                  state='normal' if _LOCAL_SOLVE else 'disabled').pack(side='left')
 
         # ── Status ────────────────────────────────────────────────────
         self.status_var = tk.StringVar(value="Ready.")
@@ -267,6 +310,32 @@ class StreakerAstro:
         state = 'normal' if self.stretch_var.get() == 'blackpoint' else 'disabled'
         self._bp_scale.config(state=state)
         self._bp_hint.config(fg='#666666' if state == 'normal' else '#444444')
+
+    def _local_solve(self):
+        """Open offline plate solver: click named stars → WCS → pixel scale + FOV."""
+        if not self.stack_path or not os.path.isfile(self.stack_path):
+            messagebox.showwarning("No stack", "Load a stack image first.", parent=self.root)
+            return
+
+        def _on_result(result):
+            px = result.get('pixel_scale_arcsec', 0)
+            fov_w = result.get('fov_width_deg', 0)
+            fov_h = result.get('fov_height_deg', 0)
+            cra  = result.get('center_ra', 0)
+            cdec = result.get('center_dec', 0)
+            # Pre-fill FOV hint with the solved value
+            self.fov_var.set(f"{fov_w:.1f}")
+            # Pre-fill RA/Dec center hint fields if they exist
+            try:
+                self.ra_var.set(f"{cra:.4f}")
+                self.dec_var.set(f"{cdec:.4f}")
+            except AttributeError:
+                pass
+            self.status_var.set(
+                f"Local solve: {px:.2f}\"/px  FOV {fov_w:.2f}°×{fov_h:.2f}°  "
+                f"Center {cra:.3f}° {cdec:.3f}°  ({result.get('n_matched',0)} stars)")
+
+        LocalSolveWindow(self.root, self.stack_path, on_result=_on_result)
 
     def _manual_calibrate(self):
         """Open click-to-calibrate window: two stars → pixel scale → meteor velocity."""
@@ -742,6 +811,22 @@ class StreakerAstro:
             self.stack_path = path
             self.stack_lbl.config(text=path, fg=FG)
 
+    def _browse_mask(self):
+        path = filedialog.askopenfilename(
+            title="Select mask PNG",
+            filetypes=[("PNG", "*.png"), ("All files", "*.*")])
+        if path:
+            self.mask_path = path
+            self.mask_lbl.config(text=os.path.basename(path), fg=FG)
+            self.cfg['mask_path'] = path
+            _save_config(self.cfg)
+
+    def _clear_mask(self):
+        self.mask_path = ''
+        self.mask_lbl.config(text="None (optional)", fg='#666666')
+        self.cfg.pop('mask_path', None)
+        _save_config(self.cfg)
+
     def _browse_event(self):
         path = filedialog.askdirectory(title="Select event folder (contains metadata.json)")
         if path:
@@ -840,7 +925,7 @@ class StreakerAstro:
                 raise RuntimeError(f"Login failed: {resp.get('errormessage', resp)}")
             session = resp['session']
 
-            # 2. Upload (optionally stretch first)
+            # 2. Upload (optionally mask + stretch first)
             upload_path = self.stack_path
             tmp_stretch = None
             stretch_mode = self.stretch_var.get()
@@ -850,9 +935,31 @@ class StreakerAstro:
                     self.stack_path, mode=stretch_mode,
                     bp_percentile=self.bp_var.get())
                 upload_path = tmp_stretch
-                self.cfg['stretch_mode']   = stretch_mode
                 self.cfg['bp_percentile']  = self.bp_var.get()
                 _save_config(self.cfg)
+            if self.mask_path and os.path.isfile(self.mask_path):
+                self._set_status("Applying mask…")
+                import tempfile, numpy as np
+                from PIL import Image as _PIL
+                import cv2 as _cv2
+                img = np.array(_PIL.open(upload_path).convert('RGB'))
+                mask = _cv2.imread(self.mask_path, _cv2.IMREAD_GRAYSCALE)
+                if mask is not None:
+                    if mask.shape[:2] != img.shape[:2]:
+                        mask = _cv2.resize(mask, (img.shape[1], img.shape[0]),
+                                           interpolation=_cv2.INTER_NEAREST)
+                    img[mask == 0] = 0
+                tmp_masked = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
+                tmp_masked.close()
+                _PIL.fromarray(img).save(tmp_masked.name)
+                if tmp_stretch:
+                    try:
+                        os.remove(tmp_stretch)
+                    except Exception:
+                        pass
+                    tmp_stretch = None
+                upload_path = tmp_masked.name
+                tmp_stretch = tmp_masked.name
             self._set_status("Uploading stack…")
             upload_params = {
                 'session': session,
@@ -915,20 +1022,21 @@ class StreakerAstro:
             self._set_status(f"Job #{job_id} assigned — solving…")
 
             # 4. Wait for solve
-            for attempt in range(72):
+            for attempt in range(180):
                 time.sleep(5)
                 r = requests.get(f"{ASTROMETRY_URL}/jobs/{job_id}", timeout=15)
                 status = r.json().get('status', '')
+                elapsed = attempt * 5
                 self._set_status(
-                    f"Job #{job_id} — {status}  ({attempt * 5}s elapsed)")
+                    f"Job #{job_id} — {status}  ({elapsed}s elapsed)")
                 if status == 'success':
                     break
                 if status == 'failure':
                     raise RuntimeError(
                         "Plate solve failed — try a brighter/sharper stack, "
-                        "or more frames.")
+                        "more frames, or set a FOV hint.")
             else:
-                raise RuntimeError("Solve timed out after 6 minutes.")
+                raise RuntimeError("Solve timed out after 15 minutes.")
 
             # 5. Download WCS
             self._set_status("Downloading WCS…")
@@ -1052,6 +1160,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--stack', default=None, help="Path to stacked PNG")
     parser.add_argument('--event', default=None, help="Path to event folder")
+    parser.add_argument('--config-dir', default=None, help="Directory for config file")
     args = parser.parse_args()
 
     root = tk.Tk()
@@ -1060,4 +1169,11 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    import traceback
+    _log = os.path.join(os.path.expanduser('~'), 'streaker_astro_crash.log')
+    try:
+        main()
+    except Exception:
+        with open(_log, 'w') as _f:
+            _f.write(traceback.format_exc())
+        raise

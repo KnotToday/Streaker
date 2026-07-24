@@ -1,5 +1,6 @@
 import sys
 import os
+import atexit
 import shutil
 import subprocess
 import builtins
@@ -51,8 +52,9 @@ for filename in os.listdir(log_folder):
         except OSError as e:
             print(f"[LOG CLEANUP ERROR] Could not process {filename}: {e}")
 
-# Today's log file
-log_filename = now.strftime("stream_capture_%Y-%m-%d.log")
+# Today's log file — suffix with cam2 if launched as second instance
+_cam_suffix = "_cam2" if os.environ.get("STREAKER_CONFIG") else ""
+log_filename = now.strftime(f"stream_capture_%Y-%m-%d{_cam_suffix}.log")
 log_path = os.path.join(log_folder, log_filename)
 
 # Redirect stdout and stderr
@@ -62,6 +64,32 @@ sys.stderr = log_file
 
 VERSION = "v1.000"
 print(f"[INFO] STREAKERrec {VERSION} starting up")
+
+
+def _excepthook(exc_type, exc_value, exc_tb):
+    print(f"[CRASH] Unhandled {exc_type.__name__}: {exc_value}")
+    traceback.print_exception(exc_type, exc_value, exc_tb)
+    log_file.flush()
+
+
+sys.excepthook = _excepthook
+
+# Module-level reference so atexit can terminate ffmpeg even if the instance
+# is gone (e.g. Python exits via an exception rather than the window close).
+_active_ffmpeg = [None]
+
+
+@atexit.register
+def _kill_ffmpeg_on_exit():
+    proc = _active_ffmpeg[0]
+    if proc and proc.poll() is None:
+        print("[INFO] atexit: terminating ffmpeg before PyInstaller cleanup...")
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            proc.kill()
+    log_file.flush()
 
 # Timestamped print
 def timestamped_print(*args, **kwargs):
@@ -73,7 +101,7 @@ if getattr(sys, 'frozen', False):
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-CONFIG_FILE = os.path.join(BASE_DIR, "stream_capture_config.json")
+CONFIG_FILE = os.environ.get("STREAKER_CONFIG") or os.path.join(BASE_DIR, "stream_capture_config.json")
 
 
     
@@ -104,6 +132,31 @@ class StreamCapture:
 
         self.calculate_twilight_times()
         self.build_gui()
+        cam = self.camera_id.get()
+        self.root.title(f"STREAKERrec — {cam}")
+        if os.environ.get("STREAKER_CONFIG"):
+            self.root.geometry("+250+250")
+        self.root.lift()
+        self.root.attributes('-topmost', True)
+        self.root.after(200, lambda: self.root.attributes('-topmost', False))
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _on_close(self):
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        print(f"[INFO] Window closed by user at {ts}")
+        self.stop_event.set()
+        proc = self.recording_process
+        if proc and proc.poll() is None:
+            print("[INFO] Terminating ffmpeg before exit...")
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+                print(f"[INFO] ffmpeg terminated, rc={proc.returncode}")
+            except Exception:
+                print("[WARNING] ffmpeg did not stop in 5s — killing")
+                proc.kill()
+        log_file.flush()
+        self.root.destroy()
 
     def update_stop_offset_label(self):
         offset = self.stop_time_offset.get()
@@ -188,10 +241,19 @@ class StreamCapture:
             print("[DEBUG] Entering recording loop")
             while True:
                 now = datetime.now(timezone.utc)
-                print(f"[DEBUG] Current Time: {now}, End Time: {end_dt}")
-                if now >= end_dt or self.stop_event.is_set():
+                if self.stop_event.is_set():
+                    print(f"[INFO] Recording loop exit: stop requested at {now.strftime('%H:%M:%S UTC')}")
                     break
-                timestamp = datetime.now(timezone.utc).strftime("%H-%M-%S")
+                if now >= end_dt:
+                    print(f"[INFO] Recording loop exit: reached scheduled end {end_dt.strftime('%H:%M:%S UTC')}")
+                    break
+
+                # Re-assert keep-awake each chunk so Windows can't sleep mid-session
+                if os.name == 'nt':
+                    import ctypes
+                    ctypes.windll.kernel32.SetThreadExecutionState(0x80000003)
+
+                timestamp = now.strftime("%H-%M-%S")
                 output_folder = self.create_date_folder(self.output_dir.get())
                 filename = f"{self.session_start_date}_{timestamp}.mkv"
                 filepath = os.path.join(output_folder, filename)
@@ -203,17 +265,20 @@ class StreamCapture:
                     "-avoid_negative_ts", "make_zero", "-t", str(chunk_seconds), filepath
                 ]
 
-                print(f"[DEBUG] Starting recording: {filepath}")
+                print(f"[DEBUG] Starting chunk: {filepath}")
                 self.recording_process = subprocess.Popen(
                     cmd,
                     creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
                     stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL
+                    stderr=log_file,
                 )
+                _active_ffmpeg[0] = self.recording_process
                 self.recording_process.wait()
-                print(f"[DEBUG] ffmpeg exited with code {self.recording_process.returncode}")
-                if self.recording_process.returncode not in (0, 1):
-                    print(f"[ERROR] ffmpeg failed (code {self.recording_process.returncode})")
+                _active_ffmpeg[0] = None
+                rc = self.recording_process.returncode
+                print(f"[DEBUG] ffmpeg chunk finished, rc={rc}")
+                if rc not in (0, 1):
+                    print(f"[WARNING] Unexpected ffmpeg exit code {rc} — possible stream error or crash")
 
             if os.name == 'nt':
                 import ctypes

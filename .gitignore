@@ -19,6 +19,8 @@
 /Streaker Detect/clips_*/
 /Streaker Detect/*.log
 /Streaker Detect/streaker_config.json
+/Streaker Detect/shared_config.json
+/Streaker Detect/streaker_astro_config.json
 
 # Get_TLE — exclude credentials, downloaded TLE data, and logs
 /Get_TLE/tle_config.json
@@ -27,7 +29,9 @@
 
 # Record — exclude credentials, build artifacts, and logs
 /Record/stream_capture_config.json
+/Record/stream_capture_config_cam2.json
 /Record/logs/
+/Record/bin/
 /Record/build/
 /Record/dist/
 /Record/python/

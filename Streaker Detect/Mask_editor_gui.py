@@ -3,108 +3,156 @@ import sys
 import random
 import cv2
 import numpy as np
-from tkinter import (
-    Tk, Toplevel, Label, Button, Canvas, filedialog, messagebox,
-    Frame, StringVar
-)
+from tkinter import Tk, Canvas, filedialog, messagebox, Frame, StringVar, Label, Button
 from PIL import Image, ImageTk
+
+# ── Design tokens ──────────────────────────────────────────────────────────────
+BG    = '#0c0c0c'
+SURF  = '#141414'
+BTN   = '#1e1e1e'
+BTN_A = '#2a2a2a'
+FG    = '#e0e0e0'
+FG2   = '#555555'
+GREEN = '#22c55e'
+AMBER = '#f59e0b'
+FONT  = 'Segoe UI'
+
+
+def _btn(parent, text, cmd, fg=FG, bg=BTN, **kw):
+    b = Button(parent, text=text, command=cmd,
+               bg=bg, fg=fg, relief='flat',
+               font=(FONT, 9), padx=0, pady=7,
+               activebackground=BTN_A, activeforeground='#ffffff',
+               cursor='hand2', **kw)
+    b.pack(fill='x', padx=10, pady=2)
+    return b
+
+
+def _divider(parent):
+    Frame(parent, bg='#222222', height=1).pack(fill='x', padx=10, pady=8)
+
+
+def _section(parent, text):
+    Label(parent, text=text, bg=SURF, fg=FG2,
+          font=(FONT, 7, 'bold'), anchor='w').pack(fill='x', padx=14, pady=(6, 1))
 
 
 class MaskEditor:
     def __init__(self, root):
         self.root = root
         self.root.title("Mask Editor")
-
-        self.canvas = Canvas(root, cursor="cross", bg="black")
-        self.canvas.pack(fill="both", expand=True)
-
-        self.ctrl_win = Toplevel(root)
-        self.ctrl_win.title("Controls")
-        self.ctrl_win.attributes("-topmost", True)
-        self.ctrl_win.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.configure(bg=BG)
+        self.root.geometry('1280x820')
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        frm = Frame(self.ctrl_win)
-        frm.pack()
+        # ── Layout ────────────────────────────────────────────────────────────
+        sidebar = Frame(root, bg=SURF, width=176)
+        sidebar.pack(side='left', fill='y')
+        sidebar.pack_propagate(False)
 
-        Button(frm, text="Grab Frame from MKV",   command=self.grab_mkv_frame).pack(pady=2)
-        Button(frm, text="Load Image",            command=self.load_image).pack(pady=2)
-        Button(frm, text="Load Existing Mask",    command=self.load_mask).pack(pady=2)
-        Button(frm, text="Clear Mask",            command=self.clear_mask).pack(pady=2)
-        Button(frm, text="Save Mask",             command=self.save_mask).pack(pady=2)
-        Button(frm, text="Undo",                  command=self.undo).pack(pady=2)
-        Button(frm, text="Zoom In",               command=self.zoom_in).pack(pady=2)
-        Button(frm, text="Zoom Out",              command=self.zoom_out).pack(pady=2)
-        Button(frm, text="Fit to Window",         command=self.fit_to_window).pack(pady=2)
+        right = Frame(root, bg=BG)
+        right.pack(side='left', fill='both', expand=True)
 
-        self.mode = StringVar(value="Polygon")
-        self.mode_button = Button(frm, text="Switch to Rectangle Mode", command=self.toggle_mode)
-        self.mode_button.pack(pady=10)
+        self.canvas = Canvas(right, cursor='crosshair', bg='#000000',
+                             highlightthickness=0)
+        self.canvas.pack(fill='both', expand=True)
 
-        self.pan_button = Button(frm, text="Enter Pan Mode", command=self.toggle_pan_mode)
-        self.pan_button.pack(pady=10)
+        bar = Frame(root, bg=SURF, height=26)
+        bar.pack(side='bottom', fill='x')
+        bar.pack_propagate(False)
+        self._status = StringVar(value="Load an image to begin")
+        Label(bar, textvariable=self._status, bg=SURF, fg=FG2,
+              font=(FONT, 8), anchor='w').pack(side='left', padx=10)
 
-        self.status = StringVar(value="Mode: Polygon | Zoom: 1.00x")
-        Label(frm, textvariable=self.status).pack(pady=10)
+        # ── Sidebar ───────────────────────────────────────────────────────────
+        Label(sidebar, text='MASK EDITOR', bg=SURF, fg='#333333',
+              font=(FONT, 8, 'bold')).pack(pady=(16, 2))
+        Frame(sidebar, bg='#222222', height=1).pack(fill='x')
 
-        self.canvas.bind("<Button-1>",       self.on_left_click)
-        self.canvas.bind("<B1-Motion>",      self.on_drag)
-        self.canvas.bind("<ButtonRelease-1>", self.end_drag)
-        self.canvas.bind("<Button-3>",       self.complete_polygon)
-        self.canvas.bind("<Motion>",         self.on_motion)
-        self.canvas.bind("<MouseWheel>",     self.on_mousewheel)
-        self.canvas.bind("<Configure>",      self._on_configure)
+        _section(sidebar, 'FILE')
+        _btn(sidebar, 'Load Image',         self.load_image)
+        _btn(sidebar, 'Grab MKV Frame',     self.grab_mkv_frame)
+        _btn(sidebar, 'Load Existing Mask', self.load_mask)
+        _btn(sidebar, 'Save Mask',          self.save_mask,
+             fg='#ffffff', bg='#14532d')
+        _btn(sidebar, 'Export Masked Image', self.export_masked_image,
+             fg='#ffffff', bg='#1e3a5f')
 
-        self.image      = None
-        self.tk_image   = None
-        self.mask       = None
-        self.filename   = None
-        self.points     = []
-        self.undo_stack = []
+        _divider(sidebar)
+        _section(sidebar, 'EDIT')
+        _btn(sidebar, 'Undo',               self.undo)
+        _btn(sidebar, 'Clear Mask',         self.clear_mask, fg='#fca5a5')
 
-        self.height    = 0
-        self.width     = 0
-        self.zoom      = 1.0
-        self.min_zoom  = 0.05
-        self.max_zoom  = 10.0
-        self.offset_x  = 0
-        self.offset_y  = 0
-        self.drag_start = None
-        self.pan_mode  = False
-        self.fit_mode  = True
+        _divider(sidebar)
+        _section(sidebar, 'DRAW MODE')
+        self._mode = StringVar(value='Polygon')
+        self._mode_btn = _btn(sidebar, 'Polygon', self.toggle_mode,
+                              fg='#93c5fd', bg='#172554')
 
-    # ── lifecycle ────────────────────────────────────────────────────────────
+        _divider(sidebar)
+        _section(sidebar, 'VIEW')
+        _btn(sidebar, 'Zoom In',            self.zoom_in)
+        _btn(sidebar, 'Zoom Out',           self.zoom_out)
+        _btn(sidebar, 'Fit to Window',      self.fit_to_window)
+        self._pan_btn = _btn(sidebar, 'Pan Mode',   self.toggle_pan_mode)
+
+        Label(sidebar, text='scroll = zoom\nmiddle-drag = pan\nright-click = finish poly',
+              bg=SURF, fg=FG2, font=(FONT, 7), justify='center').pack(pady=(12, 0))
+
+        # ── Canvas bindings ───────────────────────────────────────────────────
+        self.canvas.bind('<Button-1>',        self.on_left_click)
+        self.canvas.bind('<B1-Motion>',       self.on_drag)
+        self.canvas.bind('<ButtonRelease-1>', self.end_drag)
+        self.canvas.bind('<Button-3>',        self.complete_polygon)
+        self.canvas.bind('<Motion>',          self.on_motion)
+        self.canvas.bind('<MouseWheel>',      self.on_mousewheel)
+        self.canvas.bind('<Configure>',       self._on_configure)
+        self.canvas.bind('<Button-2>',        lambda e: self._pan_start(e))
+        self.canvas.bind('<B2-Motion>',       lambda e: self._pan_drag(e))
+        self.canvas.bind('<ButtonRelease-2>', lambda e: self._pan_end(e))
+
+        # ── State ─────────────────────────────────────────────────────────────
+        self.image       = None
+        self.tk_image    = None
+        self.mask        = None
+        self.filename    = None
+        self.points      = []
+        self.undo_stack  = []
+        self.height      = 0
+        self.width       = 0
+        self.zoom        = 1.0
+        self.min_zoom    = 0.02
+        self.max_zoom    = 20.0
+        self.offset_x    = 0
+        self.offset_y    = 0
+        self.drag_start  = None
+        self.pan_mode    = False
+        self.fit_mode    = True
+
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def _on_close(self):
-        for w in (self.ctrl_win, self.root):
-            try:
-                w.destroy()
-            except Exception:
-                pass
-
-    # ── undo stack ───────────────────────────────────────────────────────────
+        self.root.destroy()
 
     def _push_undo(self):
         self.undo_stack.append(self.mask.copy())
         if len(self.undo_stack) > 30:
             self.undo_stack.pop(0)
 
-    # ── image loading ────────────────────────────────────────────────────────
+    # ── Image loading ──────────────────────────────────────────────────────────
 
-    def _fit_to_half_screen(self):
+    def _fit_to_canvas(self):
         self.root.update_idletasks()
-        sw = self.root.winfo_screenwidth()
-        sh = self.root.winfo_screenheight()
-        self.zoom = min((sw // 2) / self.width, (sh // 2) / self.height)
-        self.root.geometry(f"{int(self.width * self.zoom)}x{int(self.height * self.zoom)}")
-        self.root.update_idletasks()  # let canvas adopt new geometry before first render
+        cw = max(1, self.canvas.winfo_width())
+        ch = max(1, self.canvas.winfo_height())
+        self.zoom = min(cw / self.width, ch / self.height)
         self.offset_x = 0
         self.offset_y = 0
 
     def load_image_path(self, path):
         img = cv2.imread(path)
         if img is None:
-            messagebox.showerror("Error", f"Failed to load image:\n{path}")
+            messagebox.showerror("Error", f"Failed to load:\n{path}")
             return
         self.filename = path
         self.image    = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
@@ -113,13 +161,17 @@ class MaskEditor:
         self.points.clear()
         self.undo_stack.clear()
         self.fit_mode = True
-        self._fit_to_half_screen()
+        self.root.after(50, self._fit_and_draw)
+
+    def _fit_and_draw(self):
+        self._fit_to_canvas()
         self.update_canvas()
+        self._update_status()
 
     def grab_mkv_frame(self):
         path = filedialog.askopenfilename(
             title="Select MKV File",
-            filetypes=[("MKV files", "*.mkv"), ("All video files", "*.mkv;*.mp4;*.avi")])
+            filetypes=[("Video files", "*.mkv;*.mp4;*.avi"), ("All files", "*.*")])
         if not path:
             return
         cap = cv2.VideoCapture(path)
@@ -127,17 +179,13 @@ class MaskEditor:
             messagebox.showerror("Error", f"Could not open:\n{path}")
             return
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        # pick a random frame from the middle 80% to avoid black edges
-        lo = int(total * 0.1)
-        hi = max(lo + 1, int(total * 0.9))
-        frame_num = random.randint(lo, hi - 1)
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
+        lo, hi = int(total * 0.1), max(1, int(total * 0.9))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, random.randint(lo, hi - 1))
         ret, raw = cap.read()
         cap.release()
         if not ret or raw is None:
-            messagebox.showerror("Error", f"Could not read frame {frame_num}.")
+            messagebox.showerror("Error", "Could not grab frame.")
             return
-
         self.filename = path
         self.image    = cv2.cvtColor(raw, cv2.COLOR_BGR2RGB)
         self.height, self.width = self.image.shape[:2]
@@ -145,11 +193,11 @@ class MaskEditor:
         self.points.clear()
         self.undo_stack.clear()
         self.fit_mode = True
-        self._fit_to_half_screen()
-        self.update_canvas()
+        self.root.after(50, self._fit_and_draw)
 
     def load_image(self):
-        path = filedialog.askopenfilename(filetypes=[("Image files", "*.png;*.jpg;*.jpeg")])
+        path = filedialog.askopenfilename(
+            filetypes=[("Images", "*.png;*.jpg;*.jpeg"), ("All files", "*.*")])
         if path:
             self.load_image_path(path)
 
@@ -157,12 +205,12 @@ class MaskEditor:
         path = filedialog.askopenfilename(filetypes=[("PNG Mask", "*.png")])
         if not path or self.image is None:
             return
-        mask = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-        if mask is None or mask.shape != self.mask.shape:
-            messagebox.showerror("Error", "Failed to load mask or resolution mismatch.")
+        m = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+        if m is None or m.shape != self.mask.shape:
+            messagebox.showerror("Error", "Cannot load mask or size mismatch.")
             return
         self._push_undo()
-        self.mask = mask.copy()
+        self.mask = m.copy()
         self.points.clear()
         self.update_canvas()
 
@@ -177,11 +225,31 @@ class MaskEditor:
         if self.mask is None:
             messagebox.showerror("Error", "No mask to save.")
             return
-        out_path = os.path.join(os.path.dirname(self.filename), "mask.png")
-        cv2.imwrite(out_path, self.mask)
-        messagebox.showinfo("Saved", f"Mask saved to:\n{out_path}")
+        out = os.path.join(os.path.dirname(self.filename), "mask.png")
+        cv2.imwrite(out, self.mask)
+        messagebox.showinfo("Saved", f"Mask saved:\n{out}")
 
-    # ── undo ─────────────────────────────────────────────────────────────────
+    def export_masked_image(self):
+        if self.image is None:
+            messagebox.showerror("Error", "No image loaded.")
+            return
+        if self.mask is None:
+            messagebox.showerror("Error", "No mask to apply.")
+            return
+        out = filedialog.asksaveasfilename(
+            title="Save masked image as…",
+            initialdir=os.path.dirname(self.filename),
+            initialfile="masked_" + os.path.basename(self.filename),
+            defaultextension=".png",
+            filetypes=[("PNG", "*.png"), ("All files", "*.*")])
+        if not out:
+            return
+        result = self.image.copy()
+        result[self.mask == 0] = 0
+        cv2.imwrite(out, cv2.cvtColor(result, cv2.COLOR_RGB2BGR))
+        messagebox.showinfo("Exported", f"Masked image saved:\n{out}")
+
+    # ── Undo ──────────────────────────────────────────────────────────────────
 
     def undo(self):
         if self.points:
@@ -190,26 +258,27 @@ class MaskEditor:
         elif self.undo_stack:
             self.mask = self.undo_stack.pop()
             self.update_canvas()
-        else:
-            messagebox.showinfo("Undo", "Nothing to undo.")
 
-    # ── mode / zoom ──────────────────────────────────────────────────────────
+    # ── Mode / zoom ───────────────────────────────────────────────────────────
 
     def toggle_mode(self):
-        if self.mode.get() == "Polygon":
-            self.mode.set("Rectangle")
-            self.mode_button.config(text="Switch to Polygon Mode")
+        if self._mode.get() == 'Polygon':
+            self._mode.set('Rectangle')
+            self._mode_btn.config(text='Rectangle', fg='#c4b5fd', bg='#2e1065')
         else:
-            self.mode.set("Polygon")
-            self.mode_button.config(text="Switch to Rectangle Mode")
+            self._mode.set('Polygon')
+            self._mode_btn.config(text='Polygon', fg='#93c5fd', bg='#172554')
         self.points.clear()
         self.update_canvas()
-        self.update_status()
+        self._update_status()
 
     def toggle_pan_mode(self):
         self.pan_mode = not self.pan_mode
-        self.pan_button.config(text="Exit Pan Mode" if self.pan_mode else "Enter Pan Mode")
-        self.update_status()
+        if self.pan_mode:
+            self._pan_btn.config(text='Pan: ON', fg=AMBER, bg='#292300')
+        else:
+            self._pan_btn.config(text='Pan Mode', fg=FG, bg=BTN)
+        self._update_status()
 
     def _on_configure(self, event):
         if self.fit_mode:
@@ -229,35 +298,61 @@ class MaskEditor:
         self.fit_mode = True
         self._recalculate_fit_zoom()
         self.update_canvas()
-        self.update_status()
+        self._update_status()
 
-    def update_status(self):
-        mode = "Pan" if self.pan_mode else self.mode.get()
-        fit = " | Fit" if self.fit_mode else ""
-        self.status.set(f"Mode: {mode} | Zoom: {self.zoom:.2f}x{fit}")
+    def _update_status(self):
+        if self.image is None:
+            self.status.set("Load an image to begin")  # type: ignore[attr-defined]
+            return
+        mode = 'Pan' if self.pan_mode else self._mode.get()
+        name = os.path.basename(self.filename) if self.filename else '—'
+        self._status.set(
+            f"{name}  ·  {mode}  ·  {self.zoom:.2f}×"
+            f"  ·  scroll=zoom  middle-drag=pan  right-click=finish polygon")
 
     def zoom_in(self):
         self.fit_mode = False
         self.zoom = min(self.zoom * 1.25, self.max_zoom)
         self.update_canvas()
-        self.update_status()
+        self._update_status()
 
     def zoom_out(self):
         self.fit_mode = False
         self.zoom = max(self.zoom / 1.25, self.min_zoom)
         self.update_canvas()
-        self.update_status()
+        self._update_status()
 
     def on_mousewheel(self, event):
-        if event.delta > 0:
-            self.zoom_in()
-        else:
-            self.zoom_out()
+        if self.image is None:
+            return
+        factor = 1.15 if event.delta > 0 else 1 / 1.15
+        self.fit_mode = False
+        img_x = (event.x - self.offset_x) / self.zoom
+        img_y = (event.y - self.offset_y) / self.zoom
+        self.zoom = max(self.min_zoom, min(self.max_zoom, self.zoom * factor))
+        self.offset_x = int(event.x - img_x * self.zoom)
+        self.offset_y = int(event.y - img_y * self.zoom)
+        self.update_canvas()
+        self._update_status()
 
-    # ── canvas interaction ───────────────────────────────────────────────────
+    def _pan_start(self, event):
+        self.drag_start = (event.x, event.y)
+
+    def _pan_drag(self, event):
+        if self.drag_start:
+            self.fit_mode = False
+            self.offset_x += event.x - self.drag_start[0]
+            self.offset_y += event.y - self.drag_start[1]
+            self.drag_start = (event.x, event.y)
+            self.update_canvas()
+
+    def _pan_end(self, event):
+        self.drag_start = None
+
+    # ── Canvas interaction ────────────────────────────────────────────────────
 
     def on_motion(self, event):
-        if not self.pan_mode and self.mode.get() == "Rectangle" and len(self.points) == 1:
+        if not self.pan_mode and self._mode.get() == 'Rectangle' and len(self.points) == 1:
             self.update_canvas()
 
     def on_left_click(self, event):
@@ -270,18 +365,19 @@ class MaskEditor:
         y = int((event.y - self.offset_y) / self.zoom)
         if not (0 <= x < self.width and 0 <= y < self.height):
             return
-        if self.mode.get() == "Polygon":
+        if self._mode.get() == 'Polygon':
             self.points.append((x, y))
-        elif self.mode.get() == "Rectangle":
+        elif self._mode.get() == 'Rectangle':
             self.points.append((x, y))
             if len(self.points) == 2:
                 self._push_undo()
-                cv2.rectangle(self.mask, self.points[0], self.points[1], 0, thickness=-1)
+                cv2.rectangle(self.mask, self.points[0], self.points[1], 0, -1)
                 self.points.clear()
         self.update_canvas()
 
     def on_drag(self, event):
         if self.pan_mode and self.drag_start:
+            self.fit_mode = False
             self.offset_x += event.x - self.drag_start[0]
             self.offset_y += event.y - self.drag_start[1]
             self.drag_start = (event.x, event.y)
@@ -291,63 +387,67 @@ class MaskEditor:
         self.drag_start = None
 
     def complete_polygon(self, event=None):
-        if self.mode.get() != "Polygon" or len(self.points) < 3:
+        if self._mode.get() != 'Polygon' or len(self.points) < 3:
             return
         self._push_undo()
         cv2.fillPoly(self.mask, [np.array(self.points, dtype=np.int32)], 0)
         self.points.clear()
         self.update_canvas()
 
-    # ── rendering ────────────────────────────────────────────────────────────
+    # ── Rendering ─────────────────────────────────────────────────────────────
 
     def update_canvas(self):
         if self.image is None or self.mask is None:
             return
 
         overlay = self.image.copy()
-        overlay[self.mask == 0] = (255, 0, 0)
+        # Masked regions: deep red tint
+        mx = self.mask == 0
+        overlay[mx] = (overlay[mx].astype(np.float32) * 0.2 +
+                       np.array([180, 30, 30], dtype=np.float32) * 0.8).clip(0, 255).astype(np.uint8)
 
-        # Draw in-progress shape
-        thickness = max(1, int(1 / self.zoom))
-        radius    = max(1, int(3 / self.zoom))
+        tk = max(1, int(1.5 / self.zoom))
+        rk = max(1, int(5 / self.zoom))
         if not self.pan_mode:
-            if self.mode.get() == "Polygon" and self.points:
+            if self._mode.get() == 'Polygon' and self.points:
                 for i, pt in enumerate(self.points):
-                    cv2.circle(overlay, pt, radius, (0, 255, 0), -1)
+                    cv2.circle(overlay, pt, rk, (80, 220, 120), -1)
                     if i > 0:
-                        cv2.line(overlay, self.points[i - 1], pt, (0, 255, 0), thickness)
-            elif self.mode.get() == "Rectangle" and len(self.points) == 1:
-                mx = self.canvas.winfo_pointerx() - self.canvas.winfo_rootx()
-                my = self.canvas.winfo_pointery() - self.canvas.winfo_rooty()
-                x2 = int((mx - self.offset_x) / self.zoom)
-                y2 = int((my - self.offset_y) / self.zoom)
-                cv2.rectangle(overlay, self.points[0], (x2, y2), (0, 255, 0), thickness)
+                        cv2.line(overlay, self.points[i - 1], pt, (80, 220, 120), tk)
+                mx2 = self.canvas.winfo_pointerx() - self.canvas.winfo_rootx()
+                my2 = self.canvas.winfo_pointery() - self.canvas.winfo_rooty()
+                xp = int((mx2 - self.offset_x) / self.zoom)
+                yp = int((my2 - self.offset_y) / self.zoom)
+                cv2.line(overlay, self.points[-1], (xp, yp), (80, 220, 120), tk)
+            elif self._mode.get() == 'Rectangle' and len(self.points) == 1:
+                mx2 = self.canvas.winfo_pointerx() - self.canvas.winfo_rootx()
+                my2 = self.canvas.winfo_pointery() - self.canvas.winfo_rooty()
+                x2 = int((mx2 - self.offset_x) / self.zoom)
+                y2 = int((my2 - self.offset_y) / self.zoom)
+                cv2.rectangle(overlay, self.points[0], (x2, y2), (80, 220, 120), tk)
 
-        # Scale to zoom
-        new_w = max(1, int(self.width  * self.zoom))
-        new_h = max(1, int(self.height * self.zoom))
-        scaled = cv2.resize(overlay, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        nw = max(1, int(self.width  * self.zoom))
+        nh = max(1, int(self.height * self.zoom))
+        scaled = cv2.resize(overlay, (nw, nh), interpolation=cv2.INTER_LINEAR)
 
-        # Viewport-clip so we never allocate more than canvas size
         cw = max(1, self.canvas.winfo_width())
         ch = max(1, self.canvas.winfo_height())
         view  = np.zeros((ch, cw, 3), dtype=np.uint8)
-        src_x = max(0, -self.offset_x)
-        src_y = max(0, -self.offset_y)
-        dst_x = max(0, self.offset_x)
-        dst_y = max(0, self.offset_y)
-        cpy_w = min(new_w - src_x, cw - dst_x)
-        cpy_h = min(new_h - src_y, ch - dst_y)
-        if cpy_w > 0 and cpy_h > 0:
-            view[dst_y:dst_y + cpy_h, dst_x:dst_x + cpy_w] = \
-                scaled[src_y:src_y + cpy_h, src_x:src_x + cpy_w]
+        sx = max(0, -self.offset_x)
+        sy = max(0, -self.offset_y)
+        dx = max(0,  self.offset_x)
+        dy = max(0,  self.offset_y)
+        cpw = min(nw - sx, cw - dx)
+        cph = min(nh - sy, ch - dy)
+        if cpw > 0 and cph > 0:
+            view[dy:dy+cph, dx:dx+cpw] = scaled[sy:sy+cph, sx:sx+cpw]
 
         self.tk_image = ImageTk.PhotoImage(Image.fromarray(view))
-        self.canvas.delete("all")
-        self.canvas.create_image(0, 0, anchor="nw", image=self.tk_image)
+        self.canvas.delete('all')
+        self.canvas.create_image(0, 0, anchor='nw', image=self.tk_image)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     root = Tk()
     app = MaskEditor(root)
     if len(sys.argv) > 1 and os.path.isfile(sys.argv[1]):

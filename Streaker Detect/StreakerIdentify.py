@@ -14,7 +14,6 @@ import datetime
 import subprocess
 import urllib.request
 import urllib.parse
-import base64
 from pathlib import Path
 from collections import defaultdict
 
@@ -222,81 +221,74 @@ def teme_to_ecef(x, y, z, dt_utc):
     return xe, ye, ze
 
 
-# ── OpenSky ───────────────────────────────────────────────────────────────────
+# ── FlightAware AeroAPI ───────────────────────────────────────────────────────
 
-_OPENSKY_UNAVAILABLE = False   # set True on first 403 to skip all further queries
-
-def query_opensky(lat, lon, dt_utc, username='', password='', radius_deg=2.5):
+def query_flightaware(lat, lon, dt_utc, api_key, radius_deg=2.5):
     """
-    Query OpenSky historical state vectors.
-    Returns list of aircraft dicts (each has lat, lon, alt_m, speed_ms, az, el,
-    angular_rate_deg_s) or [].
-    Sets module-level _OPENSKY_UNAVAILABLE=True on HTTP 403 so callers can
-    skip further queries for the rest of the run.
+    Query FlightAware AeroAPI v4 for flights in a bounding box around (lat, lon)
+    within ±5 minutes of dt_utc.
+    Returns list of aircraft dicts (same schema as query_opensky) or [].
     """
-    global _OPENSKY_UNAVAILABLE
-    if _OPENSKY_UNAVAILABLE:
+    if not api_key:
         return []
 
-    unix_t = int(dt_utc.timestamp())
-    params = {
-        'time':  unix_t,
-        'lamin': lat - radius_deg,
-        'lomin': lon - radius_deg,
-        'lamax': lat + radius_deg,
-        'lomax': lon + radius_deg,
-    }
-    url = ('https://opensky-network.org/api/states/all?'
-           + urllib.parse.urlencode(params))
-    req = urllib.request.Request(url,
-          headers={'User-Agent': 'StreakerIdentify/1.0'})
-    if username and password:
-        creds = base64.b64encode(f'{username}:{password}'.encode()).decode()
-        req.add_header('Authorization', f'Basic {creds}')
+    lamin = lat - radius_deg
+    lamax = lat + radius_deg
+    lomin = lon - radius_deg
+    lomax = lon + radius_deg
+
+    start = (dt_utc - datetime.timedelta(minutes=5)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    end   = (dt_utc + datetime.timedelta(minutes=5)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    fql   = f'-latlong "{lamin} {lomin} {lamax} {lomax}"'
+
+    url = ('https://aeroapi.flightaware.com/aeroapi/flights/search?'
+           + urllib.parse.urlencode({'query': fql, 'start': start, 'end': end}))
+    req = urllib.request.Request(url, headers={
+        'x-apikey': api_key,
+        'Accept':   'application/json; charset=UTF-8',
+    })
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read())
     except urllib.error.HTTPError as e:
-        if e.code == 403:
-            _OPENSKY_UNAVAILABLE = True
-            print('    [OpenSky] 403 — historical API requires a research account '
-                  '(opensky-network.org). Aircraft matching disabled for this run.')
-        else:
-            print(f'    [OpenSky] query failed: {e}')
+        print(f'    [FlightAware] query failed: HTTP {e.code} — {e.reason}')
         return []
     except Exception as e:
-        print(f'    [OpenSky] query failed: {e}')
+        print(f'    [FlightAware] query failed: {e}')
         return []
 
     obs_x, obs_y, obs_z = latlon_to_ecef(lat, lon, 100)
     result = []
-    for s in (data.get('states') or []):
-        ac_lon, ac_lat = s[5], s[6]
-        if ac_lon is None or ac_lat is None:
+    for flight in (data.get('flights') or []):
+        pos = flight.get('last_position') or {}
+        ac_lat = pos.get('latitude')
+        ac_lon = pos.get('longitude')
+        if ac_lat is None or ac_lon is None:
             continue
-        alt_m = s[13] or s[7] or 10000   # geo_alt → baro_alt → default
-        spd   = s[9] or 0                # m/s
+        alt_ft = pos.get('altitude') or 0      # feet MSL
+        alt_m  = alt_ft * 0.3048
+        spd_kt = pos.get('groundspeed') or 0   # knots
+        spd_ms = spd_kt * 0.514444
 
         ax, ay, az_ = latlon_to_ecef(ac_lat, ac_lon, alt_m)
         e, n, u = ecef_to_enu(ax - obs_x, ay - obs_y, az_ - obs_z, lat, lon)
         if u <= 0:
-            continue   # below horizon
+            continue
 
         az_deg, el_deg = enu_to_azel(e, n, u)
-        dist = math.sqrt(e*e + n*n + u*u)
-        # Angular rate: speed is mostly transverse for a passing aircraft
-        ang_rate = math.degrees(spd / dist) if dist > 0 and spd > 0 else 0.0
+        dist     = math.sqrt(e*e + n*n + u*u)
+        ang_rate = math.degrees(spd_ms / dist) if dist > 0 and spd_ms > 0 else 0.0
 
         result.append({
-            'icao24':            s[0],
-            'callsign':          (s[1] or '').strip(),
-            'lat':               ac_lat,
-            'lon':               ac_lon,
-            'alt_m':             alt_m,
-            'speed_ms':          spd,
-            'az':                round(az_deg, 1),
-            'el':                round(el_deg, 1),
-            'dist_m':            round(dist),
+            'icao24':             (flight.get('registration') or '').strip(),
+            'callsign':           (flight.get('ident') or '').strip(),
+            'lat':                ac_lat,
+            'lon':                ac_lon,
+            'alt_m':              round(alt_m),
+            'speed_ms':           round(spd_ms, 1),
+            'az':                 round(az_deg, 1),
+            'el':                 round(el_deg, 1),
+            'dist_m':             round(dist),
             'angular_rate_deg_s': round(ang_rate, 3),
         })
     return result
@@ -498,15 +490,14 @@ def classify(analysis, ac_above_horizon, sat_matches):
                                      'no TLE match')
         elif not ac_above_horizon:
             out['classification'] = 'unidentified'
-            out['flag_reason']    = ('no OpenSky data — historical API requires '
-                                     'research account; rate-only classification only')
+            out['flag_reason']    = 'no FlightAware data — check API key or query limit'
         else:
             # Speed is plausible but nothing matches
             if rate > 3.0:
                 out['classification'] = 'unidentified satellite?'
             else:
                 out['classification'] = 'unidentified aircraft?'
-            out['flag_reason'] = 'no OpenSky or TLE match at this angular rate'
+            out['flag_reason'] = 'no FlightAware or TLE match at this angular rate'
 
     return out
 
@@ -525,10 +516,9 @@ def identify_folder(events_folder, config, calib, tle_path=None,
         if progress_cb:
             progress_cb(msg)
 
-    lat      = config.get('latitude',  0.0)
-    lon      = config.get('longitude', 0.0)
-    osky_usr = config.get('opensky_username', '')
-    osky_pwd = config.get('opensky_password', '')
+    lat    = config.get('latitude',  0.0)
+    lon    = config.get('longitude', 0.0)
+    fa_key = config.get('flightaware_api_key', '')
 
     # Discover event directories
     event_dirs = sorted([
@@ -595,16 +585,16 @@ def identify_folder(events_folder, config, calib, tle_path=None,
 
             analysis = analyze_event(meta, calib)
 
-            # ── OpenSky ─────────────────────────────────────────────────────
+            # ── Aircraft query (FlightAware) ─────────────────────────────────
             ac_above_horizon = []
-            if event_time:
+            if event_time and fa_key:
                 bucket = int(event_time.timestamp() // 60)
                 if bucket not in opensky_cache:
-                    log(f'   [OpenSky] querying '
+                    log(f'   [FlightAware] querying '
                         f'{event_time.strftime("%H:%M:%S UTC")}…')
-                    raw = query_opensky(lat, lon, event_time, osky_usr, osky_pwd)
+                    raw = query_flightaware(lat, lon, event_time, fa_key)
                     opensky_cache[bucket] = raw
-                    log(f'             {len(raw)} aircraft above horizon')
+                    log(f'               {len(raw)} aircraft above horizon')
                 ac_above_horizon = opensky_cache[bucket]
 
             # ── TLE / satellite matching ─────────────────────────────────────
@@ -649,11 +639,14 @@ def identify_folder(events_folder, config, calib, tle_path=None,
 # ── Config helpers ────────────────────────────────────────────────────────────
 
 def _load_config():
-    """Load shared_config.json from the SkyEye sibling directory."""
-    base      = Path(__file__).parent
+    """Load shared_config.json — next to the exe when frozen, else next to this script."""
+    if getattr(sys, 'frozen', False):
+        base = Path(sys.executable).parent
+    else:
+        base = Path(__file__).parent
     candidates = [
-        base.parent.parent / 'SkyEye' / 'shared_config.json',
         base / 'shared_config.json',
+        base.parent.parent / 'SkyEye' / 'shared_config.json',
     ]
     for p in candidates:
         if p.exists():

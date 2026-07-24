@@ -34,11 +34,11 @@ else:
     _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 CONFIG_PATH   = os.path.join(_BASE_DIR, 'streaker_config.json')
+SHARED_CONFIG_PATH = os.path.join(_BASE_DIR, 'shared_config.json')
 CAMERAS_PATH  = os.path.join(_BASE_DIR, 'cameras.json')
 
 from platform_utils import (FFMPEG_PATH, HWACCEL_ARGS, NO_WINDOW,
-                            play_completion_sound, PYTHON_EXE,
-                            find_companion_script)
+                            play_completion_sound, launch_companion)
 
 # ------------------------------------------------------------------------------
 # Detection Parameters (defaults — all tunable in GUI)
@@ -325,18 +325,61 @@ class Tooltip:
             self._win = None
 
 
+def build_dark_frame(source, n_frames=300, progress_cb=None):
+    """
+    Read up to n_frames grayscale frames from source (MKV path or RTSP URL),
+    compute the per-pixel median, and return a float32 ndarray.
+    progress_cb(done, total) is called after each frame if provided.
+    Returns None on failure.
+    """
+    cap = cv2.VideoCapture(source)
+    if not cap.isOpened():
+        return None
+    fw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    fh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+    if fw <= 0 or fh <= 0:
+        return None
+
+    cmd = [FFMPEG_PATH, '-i', source,
+           '-f', 'rawvideo', '-pix_fmt', 'gray', 'pipe:1']
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            creationflags=NO_WINDOW)
+    frame_bytes = fw * fh
+    frames = []
+    try:
+        while len(frames) < n_frames:
+            raw = proc.stdout.read(frame_bytes)
+            if len(raw) < frame_bytes:
+                break
+            frames.append(np.frombuffer(raw, dtype=np.uint8).reshape(fh, fw).copy())
+            if progress_cb:
+                progress_cb(len(frames), n_frames)
+    finally:
+        try: proc.stdout.close()
+        except Exception: pass
+        try: proc.kill(); proc.wait()
+        except Exception: pass
+
+    if not frames:
+        return None
+    return np.median(np.stack(frames, axis=0).astype(np.float32), axis=0).astype(np.float32)
+
+
 class DetectionWorker:
     def __init__(self, input_path, mask_path, output_dir, params,
-                 preview_q, event_q, done_q, stop_event, sw_decode=False):
-        self.input_path  = input_path
-        self.mask_path   = mask_path
-        self.output_dir  = output_dir
-        self.params      = params
-        self.preview_q   = preview_q
-        self.event_q     = event_q
-        self.done_q      = done_q
-        self.stop_event  = stop_event
-        self.sw_decode   = sw_decode
+                 preview_q, event_q, done_q, stop_event, sw_decode=False,
+                 dark_frame_path=None):
+        self.input_path      = input_path
+        self.mask_path       = mask_path
+        self.dark_frame_path = dark_frame_path
+        self.output_dir      = output_dir
+        self.params          = params
+        self.preview_q       = preview_q
+        self.event_q         = event_q
+        self.done_q          = done_q
+        self.stop_event      = stop_event
+        self.sw_decode       = sw_decode
 
     def run(self):
         try:
@@ -373,6 +416,17 @@ class DetectionWorker:
 
         mask = (cv2.imread(self.mask_path, cv2.IMREAD_GRAYSCALE)
                 if self.mask_path and os.path.exists(self.mask_path) else None)
+
+        dark_frame = None
+        if self.dark_frame_path and os.path.exists(self.dark_frame_path):
+            try:
+                df = np.load(self.dark_frame_path).astype(np.float32)
+                if df.shape != (fh, fw):
+                    df = cv2.resize(df, (fw, fh), interpolation=cv2.INTER_LINEAR)
+                dark_frame = df
+                print(f"[DARK] Loaded dark frame {df.shape} from {self.dark_frame_path}")
+            except Exception as e:
+                print(f"[DARK] Failed to load dark frame: {e}")
 
         # Check for checkpoint
         src_base = os.path.splitext(self.input_path)[0]
@@ -447,6 +501,9 @@ class DetectionWorker:
                 break
 
             gray = np.frombuffer(raw_bytes, dtype=np.uint8).reshape(fh, fw)
+
+            if dark_frame is not None:
+                gray = np.clip(gray.astype(np.float32) - dark_frame, 0, 255).astype(np.uint8)
 
             # Downscale for detection
             if scale != 1.0:
@@ -940,8 +997,9 @@ class EventViewer:
 PAGE_SIZE = 50
 
 class ThumbnailPanel:
-    def __init__(self, parent, on_click):
-        self.on_click   = on_click
+    def __init__(self, parent, on_click, on_view_clip=None):
+        self.on_click      = on_click
+        self.on_view_clip  = on_view_clip
         self.thumbnails  = []   # PhotoImage refs for current page
         self._flag_vars  = []   # StringVar refs for flag buttons (prevent GC)
         self.all_events  = []   # every event_info ever added
@@ -1019,8 +1077,9 @@ class ThumbnailPanel:
 
     @staticmethod
     def _flag_key(path):
-        """Normalize a path for use as a flag set key — case-insensitive, consistent separators."""
-        return os.path.normcase(os.path.normpath(path))
+        """Use just the event folder basename as the flag key.
+        This is robust against UNC vs drive-letter path differences (e.g. \\tnas\G509 vs T:)."""
+        return os.path.basename(os.path.normcase(os.path.normpath(path)))
 
     def _view_events(self):
         mode = self._sort_mode.get()
@@ -1150,9 +1209,12 @@ class ThumbnailPanel:
         tk.Label(info, text=f"{n_frames} frames  |  {n_detections} detections",
                  bg=card_bg, fg='#aaffaa',
                  font=('Arial', 9)).pack(anchor='w', pady=(2, 0))
+        def _view_in_player(d=event_dir):
+            if self.on_view_clip:
+                self.on_view_clip(d)
         tk.Button(info, text="▶ View Clip",
-                  command=_click,
-                  bg='#3a3a3a', fg='white', relief='flat',
+                  command=_view_in_player,
+                  bg='#1a3a5a', fg='white', relief='flat',
                   cursor='hand2').pack(anchor='w', pady=(4, 0))
 
     def _highlight_card(self, card):
@@ -1199,8 +1261,10 @@ class ThumbnailPanel:
         if self._flags_path and os.path.exists(self._flags_path):
             try:
                 with open(self._flags_path) as f:
+                    # Stored values may be full paths (old format) or basenames (new format)
                     self.flagged = set(
-                        os.path.normcase(os.path.normpath(p)) for p in json.load(f))
+                        os.path.basename(os.path.normcase(os.path.normpath(p)))
+                        for p in json.load(f))
                 print(f'[FLAGS] loaded {len(self.flagged)} flag(s): {self.flagged}')
             except Exception as e:
                 print(f'[FLAGS] load FAILED: {e}')
@@ -1596,9 +1660,11 @@ class StreakerDetectApp:
         master.title(f"StreakerDetect  v{VERSION}")
         master.configure(bg='#111111')
 
-        self.input_path  = tk.StringVar()
-        self.mask_path   = tk.StringVar()
-        self.output_dir  = tk.StringVar()
+        self.input_path      = tk.StringVar()
+        self.mask_path       = tk.StringVar()
+        self.dark_frame_path = tk.StringVar()
+        self.fa_key          = tk.StringVar()
+        self.output_dir      = tk.StringVar()
         self._cameras    = []        # list of profile dicts
         self._camera_var = tk.StringVar()
 
@@ -1663,42 +1729,52 @@ class StreakerDetectApp:
 
     def _load_config(self):
         self._load_cameras()
-        if not os.path.exists(CONFIG_PATH):
-            return
         try:
-            with open(CONFIG_PATH) as f:
-                c = json.load(f)
-            if c.get('mask_path') and os.path.exists(c['mask_path']):
-                self.mask_path.set(c['mask_path'])
-            if c.get('output_dir') and os.path.exists(c['output_dir']):
-                self.output_dir.set(c['output_dir'])
-            self.p_threshold.set(c.get('threshold',  DEFAULT_MOG2_THRESHOLD))
-            self.p_min_area.set(c.get('min_area',    DEFAULT_MIN_CONTOUR_AREA))
-            self.p_max_area.set(c.get('max_area',    DEFAULT_MAX_CONTOUR_AREA))
-            self.p_min_asp.set(c.get('min_aspect',   DEFAULT_MIN_ASPECT_RATIO))
-            self.p_max_track.set(c.get('max_track',       DEFAULT_MAX_TRACK_FRAMES))
-            self.p_max_match_dist.set(c.get('max_match_dist', DEFAULT_MAX_MATCH_DIST))
-            self.p_pre_buf.set(c.get('pre_buffer',   DEFAULT_PRE_BUFFER))
-            self.p_post_buf.set(c.get('post_buffer', DEFAULT_POST_BUFFER))
-            self.p_warmup.set(c.get('warmup',        DEFAULT_WARMUP_FRAMES))
-            self.p_cld_thr.set(c.get('cloud_thresh',  DEFAULT_CLOUD_THRESH))
-            self.p_cld_rat.set(c.get('cloud_ratio',   DEFAULT_CLOUD_RATIO))
-            self.p_scale.set(c.get('scale',           0.5))
-            self.p_stitch_gap.set(c.get('stitch_gap', 300))
-            self.p_stitch_tol.set(c.get('stitch_tol', 80))
-            self.p_min_move.set(c.get('min_move', 0))
-            self.p_min_travel.set(c.get('min_travel', 0))
-            self.p_min_bright.set(c.get('min_bright', 0))
-            self.p_cloud_min_bright.set(c.get('cloud_min_bright', 0))
-            self.p_cloud_min_travel.set(c.get('cloud_min_travel', 0))
+            if os.path.exists(CONFIG_PATH):
+                with open(CONFIG_PATH) as f:
+                    c = json.load(f)
+                if c.get('mask_path') and os.path.exists(c['mask_path']):
+                    self.mask_path.set(c['mask_path'])
+                if c.get('dark_frame_path') and os.path.exists(c['dark_frame_path']):
+                    self.dark_frame_path.set(c['dark_frame_path'])
+                if c.get('output_dir') and os.path.exists(c['output_dir']):
+                    self.output_dir.set(c['output_dir'])
+                self.p_threshold.set(c.get('threshold',  DEFAULT_MOG2_THRESHOLD))
+                self.p_min_area.set(c.get('min_area',    DEFAULT_MIN_CONTOUR_AREA))
+                self.p_max_area.set(c.get('max_area',    DEFAULT_MAX_CONTOUR_AREA))
+                self.p_min_asp.set(c.get('min_aspect',   DEFAULT_MIN_ASPECT_RATIO))
+                self.p_max_track.set(c.get('max_track',       DEFAULT_MAX_TRACK_FRAMES))
+                self.p_max_match_dist.set(c.get('max_match_dist', DEFAULT_MAX_MATCH_DIST))
+                self.p_pre_buf.set(c.get('pre_buffer',   DEFAULT_PRE_BUFFER))
+                self.p_post_buf.set(c.get('post_buffer', DEFAULT_POST_BUFFER))
+                self.p_warmup.set(c.get('warmup',        DEFAULT_WARMUP_FRAMES))
+                self.p_cld_thr.set(c.get('cloud_thresh',  DEFAULT_CLOUD_THRESH))
+                self.p_cld_rat.set(c.get('cloud_ratio',   DEFAULT_CLOUD_RATIO))
+                self.p_scale.set(c.get('scale',           0.5))
+                self.p_stitch_gap.set(c.get('stitch_gap', 300))
+                self.p_stitch_tol.set(c.get('stitch_tol', 80))
+                self.p_min_move.set(c.get('min_move', 0))
+                self.p_min_travel.set(c.get('min_travel', 0))
+                self.p_min_bright.set(c.get('min_bright', 0))
+                self.p_cloud_min_bright.set(c.get('cloud_min_bright', 0))
+                self.p_cloud_min_travel.set(c.get('cloud_min_travel', 0))
+        except Exception:
+            pass
+        try:
+            if os.path.exists(SHARED_CONFIG_PATH):
+                with open(SHARED_CONFIG_PATH) as f:
+                    sc = json.load(f)
+                if sc.get('flightaware_api_key'):
+                    self.fa_key.set(sc['flightaware_api_key'])
         except Exception:
             pass
 
     def _save_config(self):
         try:
             c = {
-                'mask_path':   self.mask_path.get(),
-                'output_dir':  self.output_dir.get(),
+                'mask_path':        self.mask_path.get(),
+                'dark_frame_path':  self.dark_frame_path.get(),
+                'output_dir':       self.output_dir.get(),
                 'threshold':   self.p_threshold.get(),
                 'min_area':    self.p_min_area.get(),
                 'max_area':    self.p_max_area.get(),
@@ -1721,6 +1797,16 @@ class StreakerDetectApp:
             }
             with open(CONFIG_PATH, 'w') as f:
                 json.dump(c, f, indent=2)
+        except Exception:
+            pass
+        try:
+            sc = {}
+            if os.path.exists(SHARED_CONFIG_PATH):
+                with open(SHARED_CONFIG_PATH) as f:
+                    sc = json.load(f)
+            sc['flightaware_api_key'] = self.fa_key.get().strip()
+            with open(SHARED_CONFIG_PATH, 'w') as f:
+                json.dump(sc, f, indent=2)
         except Exception:
             pass
 
@@ -1751,11 +1837,32 @@ class StreakerDetectApp:
         except Exception:
             pass
 
+    @staticmethod
+    def _newest_date_folder(base_dir):
+        """Return the newest MM-DD-YYYY subfolder in base_dir, or None."""
+        import re
+        pat = re.compile(r'^\d{2}-\d{2}-\d{4}$')
+        try:
+            subs = [d for d in os.listdir(base_dir)
+                    if pat.match(d) and os.path.isdir(os.path.join(base_dir, d))]
+        except Exception:
+            return None
+        if not subs:
+            return None
+        def _date_key(name):
+            try:
+                m, d, y = name.split('-')
+                return (int(y), int(m), int(d))
+            except Exception:
+                return (0, 0, 0)
+        return os.path.join(base_dir, max(subs, key=_date_key))
+
     def _apply_camera_profile(self, name):
         for cam in self._cameras:
             if cam['name'] == name:
                 if cam.get('input_dir'):
-                    self.input_path.set(cam['input_dir'])
+                    newest = self._newest_date_folder(cam['input_dir'])
+                    self.input_path.set(newest or cam['input_dir'])
                 if cam.get('output_dir'):
                     self.output_dir.set(cam['output_dir'])
                 if cam.get('mask_path'):
@@ -1847,8 +1954,7 @@ class StreakerDetectApp:
         tk.Button(fr, text="…", command=lambda: browse_file(v_mask),
                   bg='#444', fg=FG, relief='flat', width=2).pack(side='left', padx=(2, 0))
         def _launch_mask_editor():
-            script = find_companion_script('Mask_editor_gui.py')
-            subprocess.Popen([PYTHON_EXE, script], creationflags=NO_WINDOW)
+            launch_companion('Mask_editor_gui.py')
         tk.Button(fr, text="✎ Edit", command=_launch_mask_editor,
                   bg='#444', fg=FG, relief='flat').pack(side='left', padx=(2, 0))
 
@@ -1939,10 +2045,25 @@ class StreakerDetectApp:
         outer.pack(fill='both', expand=True)
 
         # Thumbnails — packed first so it claims full height on the right
-        thumb_col = tk.Frame(outer, bg='#1a1a1a', width=360)
-        thumb_col.pack(side='right', fill='y', padx=(2, 4), pady=0)
-        thumb_col.pack_propagate(False)
-        self.thumb_panel = ThumbnailPanel(thumb_col, self._open_event_viewer)
+        self.thumb_col = tk.Frame(outer, bg='#1a1a1a', width=360)
+        self.thumb_col.pack(side='right', fill='y', padx=(2, 4), pady=0)
+        self.thumb_col.pack_propagate(False)
+
+        # Collapse toggle button at top of the panel
+        _thumb_hdr = tk.Frame(self.thumb_col, bg='#111111')
+        _thumb_hdr.pack(fill='x', side='top')
+        self._thumb_toggle_btn = tk.Button(
+            _thumb_hdr, text="◀ hide events", command=self._toggle_thumb_panel,
+            bg='#2a2a2a', fg='#cccccc', relief='flat',
+            font=('Arial', 8), padx=8, pady=3, cursor='hand2')
+        self._thumb_toggle_btn.pack(side='left')
+
+        # Content wrapper — what gets hidden on collapse
+        self._thumb_content = tk.Frame(self.thumb_col, bg='#1a1a1a')
+        self._thumb_content.pack(fill='both', expand=True)
+        self.thumb_panel = ThumbnailPanel(self._thumb_content, self._open_event_viewer,
+                                          on_view_clip=self._view_clip_in_player)
+        self._thumb_visible = True
 
         # Left section — rows + canvas
         left_section = tk.Frame(outer, bg=BG)
@@ -2056,6 +2177,14 @@ class StreakerDetectApp:
                               relief='flat', padx=10, pady=3)
         _btn_open.pack(side='left', padx=2)
         Tooltip(_btn_open, "Open the current detection output folder in Windows Explorer.")
+
+        _btn_mask_ed = tk.Button(btn_f, text="✏ MASK",
+                                 command=self._open_mask_editor,
+                                 bg='#2a2a2a', fg='#cccccc',
+                                 font=('Arial', 9, 'bold'),
+                                 relief='flat', padx=10, pady=3)
+        _btn_mask_ed.pack(side='left', padx=2)
+        Tooltip(_btn_mask_ed, "Open Mask Editor — draw regions to exclude from detection.")
         self._events_folder_var     = tk.StringVar(value="")
         self._events_folder_full    = ""
         _folder_lbl = tk.Label(btn_f, textvariable=self._events_folder_var, bg=BG,
@@ -2093,6 +2222,31 @@ class StreakerDetectApp:
                   font=('Arial', 8), relief='flat', padx=6).pack(side='left', padx=(2, 0))
 
         file_input(r1b, "Mask (optional)", self.mask_path, self._browse_mask)
+
+        # Dark frame controls
+        df_f = tk.Frame(r1b, bg=BG)
+        df_f.pack(side='left', padx=3, pady=3)
+        tk.Label(df_f, text="Dark frame (.npy)", bg=BG, fg='#888888',
+                 font=('Arial', 7)).pack(anchor='w')
+        df_r = tk.Frame(df_f, bg=BG)
+        df_r.pack()
+        tk.Entry(df_r, textvariable=self.dark_frame_path, bg='#2a2a2a', fg='white',
+                 relief='flat', width=26).pack(side='left')
+        tk.Button(df_r, text="…",   command=self._browse_dark_frame,
+                  bg='#444444', fg='white', relief='flat', width=2).pack(side='left', padx=(1, 0))
+        tk.Button(df_r, text="MKV", command=self._build_dark_from_mkv,
+                  bg='#334455', fg='white', relief='flat', width=4).pack(side='left', padx=(1, 0))
+        tk.Button(df_r, text="CAM", command=self._capture_dark_from_rtsp,
+                  bg='#334433', fg='white', relief='flat', width=4).pack(side='left', padx=(1, 0))
+
+        # FlightAware API key
+        fa_f = tk.Frame(r1b, bg=BG)
+        fa_f.pack(side='left', padx=3, pady=3)
+        tk.Label(fa_f, text="FlightAware key", bg=BG, fg='#888888',
+                 font=('Arial', 7)).pack(anchor='w')
+        tk.Entry(fa_f, textvariable=self.fa_key, bg='#2a2a2a', fg='white',
+                 relief='flat', width=28, show='*').pack()
+
         sep(r1b)
 
         btn_f2 = tk.Frame(r1b, bg=BG)
@@ -2342,7 +2496,7 @@ class StreakerDetectApp:
                 self.mask_path.set(auto_mask)
 
     def _browse_input_folder(self):
-        path = filedialog.askdirectory(title="Select Folder of MKV Clips")
+        path = filedialog.askdirectory(title="Select Folder of MKV Clips", parent=self.root)
         if path:
             self.input_path.set(path)
             self.output_dir.set(path)
@@ -2393,8 +2547,136 @@ class StreakerDetectApp:
         if path:
             self.mask_path.set(path)
 
+    def _browse_dark_frame(self):
+        path = filedialog.askopenfilename(
+            title="Select Dark Frame",
+            filetypes=[("NumPy array", "*.npy")])
+        if path:
+            self.dark_frame_path.set(path)
+
+    def _build_dark_from_mkv(self):
+        mkv = filedialog.askopenfilename(
+            title="Select dark MKV (lens cap on)",
+            filetypes=[("MKV files", "*.mkv"), ("All files", "*.*")])
+        if not mkv:
+            return
+        out_path = os.path.splitext(mkv)[0] + '_dark.npy'
+        self._dark_capture_dialog(mkv, out_path, n_frames=300)
+
+    def _capture_dark_from_rtsp(self):
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Capture Dark Frame from Camera")
+        dlg.configure(bg='#1a1a1a')
+        dlg.resizable(False, False)
+        dlg.grab_set()
+
+        BG = '#1a1a1a'
+        FG = 'white'
+
+        # Prefill RTSP from cameras list if available
+        default_url = ''
+        if self._cameras:
+            default_url = self._cameras[0].get('rtsp_url', '')
+
+        tk.Label(dlg, text="RTSP URL:", bg=BG, fg=FG,
+                 font=('Arial', 9)).grid(row=0, column=0, sticky='e', padx=8, pady=6)
+        url_var = tk.StringVar(value=default_url)
+        tk.Entry(dlg, textvariable=url_var, bg='#2a2a2a', fg=FG, relief='flat',
+                 width=52).grid(row=0, column=1, columnspan=2, padx=(0, 8), pady=6)
+
+        tk.Label(dlg, text="Frames:", bg=BG, fg=FG,
+                 font=('Arial', 9)).grid(row=1, column=0, sticky='e', padx=8, pady=4)
+        frames_var = tk.IntVar(value=300)
+        tk.Spinbox(dlg, from_=30, to=1000, increment=30, textvariable=frames_var,
+                   bg='#2a2a2a', fg=FG, relief='flat',
+                   width=8).grid(row=1, column=1, sticky='w', padx=(0, 8), pady=4)
+
+        tk.Label(dlg, text="Save as:", bg=BG, fg=FG,
+                 font=('Arial', 9)).grid(row=2, column=0, sticky='e', padx=8, pady=4)
+        save_var = tk.StringVar(value=os.path.join(_BASE_DIR, 'dark_frame.npy'))
+        tk.Entry(dlg, textvariable=save_var, bg='#2a2a2a', fg=FG, relief='flat',
+                 width=44).grid(row=2, column=1, padx=(0, 4), pady=4)
+        def _browse_save():
+            p = filedialog.asksaveasfilename(defaultextension='.npy',
+                filetypes=[("NumPy array", "*.npy")],
+                initialfile='dark_frame.npy')
+            if p:
+                save_var.set(p)
+        tk.Button(dlg, text="…", command=_browse_save,
+                  bg='#444', fg=FG, relief='flat', width=2).grid(row=2, column=2, padx=(0, 8))
+
+        status_var = tk.StringVar(value="Ready")
+        tk.Label(dlg, textvariable=status_var, bg=BG, fg='#aaaaaa',
+                 font=('Arial', 8)).grid(row=3, column=0, columnspan=3, pady=4)
+
+        def _do_capture():
+            url = url_var.get().strip()
+            if not url:
+                status_var.set("Enter an RTSP URL first.")
+                return
+            btn_go.config(state='disabled')
+            status_var.set("Connecting…")
+            dlg.update()
+
+            def _run():
+                def _progress(done, total):
+                    status_var.set(f"Capturing {done}/{total} frames…")
+                    dlg.update()
+                dark = build_dark_frame(url, n_frames=frames_var.get(), progress_cb=_progress)
+                if dark is None:
+                    status_var.set("Failed — check URL and camera connection.")
+                    btn_go.config(state='normal')
+                    return
+                np.save(save_var.get(), dark)
+                self.dark_frame_path.set(save_var.get())
+                self._save_config()
+                status_var.set(f"Saved {dark.shape[1]}×{dark.shape[0]} dark frame.")
+                btn_go.config(state='normal')
+
+            threading.Thread(target=_run, daemon=True).start()
+
+        btn_f = tk.Frame(dlg, bg=BG)
+        btn_f.grid(row=4, column=0, columnspan=3, pady=8)
+        btn_go = tk.Button(btn_f, text="Capture", command=_do_capture,
+                           bg='#226622', fg=FG, relief='flat', padx=12, pady=4)
+        btn_go.pack(side='left', padx=4)
+        tk.Button(btn_f, text="Close", command=dlg.destroy,
+                  bg='#444', fg=FG, relief='flat', padx=12, pady=4).pack(side='left', padx=4)
+
+    def _dark_capture_dialog(self, source, out_path, n_frames=300):
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Building Dark Frame…")
+        dlg.configure(bg='#1a1a1a')
+        dlg.resizable(False, False)
+        dlg.grab_set()
+
+        BG, FG = '#1a1a1a', 'white'
+        status_var = tk.StringVar(value="Starting…")
+        tk.Label(dlg, textvariable=status_var, bg=BG, fg=FG,
+                 font=('Arial', 10), wraplength=360).pack(padx=20, pady=20)
+        bar = ttk.Progressbar(dlg, length=340, maximum=n_frames)
+        bar.pack(padx=20, pady=(0, 16))
+        dlg.update()
+
+        def _run():
+            def _progress(done, total):
+                bar['value'] = done
+                status_var.set(f"Reading frame {done}/{total}…")
+                dlg.update()
+            dark = build_dark_frame(source, n_frames=n_frames, progress_cb=_progress)
+            if dark is None:
+                status_var.set("Failed — could not read frames.")
+                return
+            np.save(out_path, dark)
+            self.dark_frame_path.set(out_path)
+            self._save_config()
+            status_var.set(f"Done — saved to {os.path.basename(out_path)}")
+            dlg.after(1500, dlg.destroy)
+
+        threading.Thread(target=_run, daemon=True).start()
+
     def _browse_output(self):
-        path = filedialog.askdirectory(title="Select Output Folder")
+        path = filedialog.askdirectory(title="Select Output Folder", parent=self.root)
         if path:
             self.output_dir.set(path)
 
@@ -2668,7 +2950,7 @@ class StreakerDetectApp:
     def _show_logs_popup(self):
         folder = self.input_path.get().strip()
         if not folder or not os.path.isdir(folder):
-            folder = filedialog.askdirectory(title="Select folder to read logs from")
+            folder = filedialog.askdirectory(title="Select folder to read logs from", parent=self.root)
         if not folder:
             return
 
@@ -2838,42 +3120,57 @@ class StreakerDetectApp:
                   bg='#333333', fg='white', relief='flat',
                   padx=12, pady=3).pack(pady=(4, 8))
 
+    def _view_clip_in_player(self, event_dir):
+        if not _PLAYER_AVAILABLE:
+            messagebox.showerror("Player Unavailable", "StreakerPlayer.py not found.")
+            return
+        meta_path = os.path.join(event_dir, 'metadata.json')
+        source_clip = None
+        if os.path.isfile(meta_path):
+            try:
+                with open(meta_path) as f:
+                    meta = json.load(f)
+                source_clip = meta.get('source_clip', '')
+            except Exception:
+                pass
+        run_folder = os.path.dirname(event_dir)
+        print(f"[DETECT] view_clip event_dir={event_dir!r}")
+        print(f"[DETECT] view_clip source_clip={source_clip!r} isfile={os.path.isfile(source_clip) if source_clip else 'N/A'}")
+        print(f"[DETECT] view_clip run_folder={run_folder!r} isdir={os.path.isdir(run_folder)}")
+        if source_clip and os.path.isfile(source_clip):
+            launch_player(initial_folder=run_folder, mkv_path=source_clip)
+        else:
+            launch_player(initial_folder=run_folder)
+
     def _launch_player(self):
         if not _PLAYER_AVAILABLE:
             messagebox.showerror("Player Unavailable", "StreakerPlayer.py not found.")
             return
-        # Prefer the MKV of the currently previewed event clip
-        mkv = getattr(self, '_player_mkv_path', None)
-        print(f"[PLAYER] _player_mkv_path={mkv!r}  exists={mkv and os.path.isfile(mkv)}")
-        if mkv and os.path.isfile(mkv):
-            launch_player(mkv_path=mkv)
+        # If an event is currently previewed, open the player to that event's source clip
+        event_dir = getattr(self, '_player_event_dir', None)
+        if event_dir and os.path.isdir(event_dir):
+            self._view_clip_in_player(event_dir)
             return
         # Fall back to current run/detect folder
         folder = getattr(self, '_current_run_dir', None)
-        print(f"[PLAYER] falling back to folder={folder!r}")
         if not folder or not os.path.isdir(folder):
             initial = self.output_dir.get() or None
             folder = filedialog.askdirectory(
                 title="Select detect folder to open in Player",
-                initialdir=initial)
+                initialdir=initial, parent=self.root)
             if not folder:
                 return
         launch_player(initial_folder=folder)
 
     def _launch_synth_test(self):
-        synth_path = find_companion_script('synth_test.py')
-        if not os.path.exists(synth_path):
-            messagebox.showerror("Not Found", f"synth_test.py not found at:\n{synth_path}")
-            return
-        # Pre-fill source and output from current UI state
         src    = self.input_path.get().strip()
         outdir = self.output_dir.get().strip()
-        cmd = [PYTHON_EXE, synth_path]
+        extra  = []
         if src:
-            cmd += ['--presource', src]
+            extra += ['--presource', src]
         if outdir:
-            cmd += ['--preoutput', outdir]
-        subprocess.Popen(cmd, creationflags=NO_WINDOW)
+            extra += ['--preoutput', outdir]
+        launch_companion('synth_test.py', extra)
 
     def _check_for_update(self):
         import urllib.request
@@ -2935,25 +3232,41 @@ class StreakerDetectApp:
         threading.Thread(target=_download, daemon=True).start()
 
     def _launch_demo(self):
-        demo_path = find_companion_script('StreakerDemo.py')
-        if not os.path.exists(demo_path):
-            messagebox.showerror("Not Found", f"StreakerDemo.py not found at:\n{demo_path}")
-            return
-        subprocess.Popen([PYTHON_EXE, demo_path], creationflags=NO_WINDOW)
+        launch_companion('StreakerDemo.py')
 
     def _launch_compare(self):
-        compare_path = find_companion_script('StreakerCompare.py')
-        if not os.path.exists(compare_path):
-            messagebox.showerror("Not Found", f"StreakerCompare.py not found at:\n{compare_path}")
-            return
-        src = self.input_path.get().strip()
-        cmd = [PYTHON_EXE, compare_path]
-        if src:
-            cmd += ['--source', src]
-        subprocess.Popen(cmd, creationflags=NO_WINDOW)
+        src   = self.input_path.get().strip()
+        extra = ['--source', src] if src else []
+        launch_companion('StreakerCompare.py', extra)
+
+    def _open_mask_editor(self):
+        try:
+            launch_companion('Mask_editor_gui.py')
+        except Exception as e:
+            messagebox.showerror("Launch Error", str(e))
+
+    def _open_streaker_player(self):
+        folder = self._events_folder_full or self.output_dir.get().strip() or None
+        extra  = [folder] if folder and os.path.isdir(folder) else []
+        try:
+            launch_companion('StreakerPlayer.py', extra)
+        except Exception as e:
+            messagebox.showerror("Launch Error", str(e))
+
+    def _toggle_thumb_panel(self):
+        if self._thumb_visible:
+            self._thumb_content.pack_forget()
+            self.thumb_col.config(width=26)
+            self._thumb_toggle_btn.config(text="▶")
+            self._thumb_visible = False
+        else:
+            self._thumb_content.pack(fill='both', expand=True)
+            self.thumb_col.config(width=360)
+            self._thumb_toggle_btn.config(text="◀ hide")
+            self._thumb_visible = True
 
     def _open_events_folder(self):
-        folder = filedialog.askdirectory(title="Select Events Folder", initialdir=self.output_dir.get() or None)
+        folder = filedialog.askdirectory(title="Select Events Folder", initialdir=self.output_dir.get() or None, parent=self.root)
         if not folder:
             return
         self._open_events_folder_path(folder)
@@ -3338,8 +3651,7 @@ class StreakerDetectApp:
             self._load_event(events[idx + 1]['dir'])
 
     def _player_send_to_compare(self):
-        compare_py = find_companion_script('StreakerCompare.py')
-        event_dir  = self._player_event_dir
+        event_dir = self._player_event_dir
 
         # Try to open the source MKV with a pre-roll window around the event
         source_mkv = None
@@ -3368,11 +3680,11 @@ class StreakerDetectApp:
                 'Open StreakerCompare manually and select the MKV file.')
             return
 
-        subprocess.Popen([PYTHON_EXE, compare_py,
-                          '--source',   source_mkv,
-                          '--start',    str(int(start_sec)),
-                          '--duration', str(int(duration))],
-                         creationflags=NO_WINDOW)
+        launch_companion('StreakerCompare.py', [
+            '--source',   source_mkv,
+            '--start',    str(int(start_sec)),
+            '--duration', str(int(duration)),
+        ])
 
     def _player_auto_cut(self, event_dir):
         """Background thread: cut tester clip as soon as a thumbnail is clicked."""
@@ -3486,7 +3798,8 @@ class StreakerDetectApp:
 
     def _run_stitcher(self):
         folder = filedialog.askdirectory(
-            title="Select events folder (or date folder containing several runs) to Stitch")
+            title="Select events folder (or date folder containing several runs) to Stitch",
+            parent=self.root)
         if not folder:
             return
 
@@ -3532,15 +3845,19 @@ class StreakerDetectApp:
     def _run_identify(self):
         folder = filedialog.askdirectory(
             title="Select detect run folder (or date folder containing several runs)",
-            initialdir=self.output_dir.get() or None)
+            initialdir=self.output_dir.get() or None, parent=self.root)
         if not folder:
             return
 
         try:
             import importlib.util
+            # When frozen, companion .py files are in sys._MEIPASS, not next to the exe
+            if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+                identify_script = os.path.join(sys._MEIPASS, 'StreakerIdentify.py')
+            else:
+                identify_script = os.path.join(_BASE_DIR, 'StreakerIdentify.py')
             spec = importlib.util.spec_from_file_location(
-                'StreakerIdentify',
-                os.path.join(_BASE_DIR, 'StreakerIdentify.py'))
+                'StreakerIdentify', identify_script)
             mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mod)
         except Exception as e:
@@ -3572,6 +3889,9 @@ class StreakerDetectApp:
         def _do():
             try:
                 config = mod._load_config()
+                fa = self.fa_key.get().strip()
+                if fa:
+                    config['flightaware_api_key'] = fa
                 calib  = mod._load_calib(config)
                 tle    = mod._find_tle(config)
                 lines  = []
@@ -3602,7 +3922,7 @@ class StreakerDetectApp:
     # --------------------------------------------------------------------------
 
     def _start_batch(self):
-        folder = filedialog.askdirectory(title="Select Folder of MKV Clips")
+        folder = filedialog.askdirectory(title="Select Folder of MKV Clips", parent=self.root)
         if not folder:
             return
 
@@ -3678,6 +3998,7 @@ class StreakerDetectApp:
         worker = DetectionWorker(
             input_path=clip,
             mask_path=self.mask_path.get().strip() or None,
+            dark_frame_path=self.dark_frame_path.get().strip() or None,
             output_dir=out,
             params=self._get_params(),
             preview_q=self.preview_q,
@@ -3850,6 +4171,20 @@ def main():
         _log_exception(*sys.exc_info())
 
 if __name__ == "__main__":
+    # --companion <ScriptName.py> [args...]: dispatch to a bundled companion script.
+    # When frozen, other tools call `sys.executable --companion X.py` instead of
+    # launching a venv Python, so no Python installation is needed on target machines.
+    if len(sys.argv) >= 3 and sys.argv[1] == '--companion':
+        import runpy
+        _companion = sys.argv[2]
+        sys.argv = [sys.argv[0]] + sys.argv[3:]
+        _script_dir = (sys._MEIPASS if (getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'))
+                       else os.path.dirname(os.path.abspath(__file__)))
+        if _script_dir not in sys.path:
+            sys.path.insert(0, _script_dir)
+        runpy.run_path(os.path.join(_script_dir, _companion), run_name='__main__')
+        raise SystemExit(0)
+
     try:
         main()
     except Exception:
