@@ -5,6 +5,7 @@
 !/Get_TLE/
 !/Record/
 !/Sat_Calcs/
+!/ErrorGrab/
 !/Streaker_Display/
 !/SkyEye/
 
@@ -54,6 +55,12 @@
 /Streaker_Display/__pycache__/
 /Streaker_Display/*.pyc
 /Streaker_Display/*.log
+
+# ErrorGrab — exclude build artifacts
+/ErrorGrab/build/
+/ErrorGrab/dist/
+/ErrorGrab/__pycache__/
+/ErrorGrab/*.pyc
 
 # SkyEye — exclude credentials, camera profiles, and build artifacts
 /SkyEye/shared_config.json
