@@ -274,7 +274,14 @@ class StreamCapture:
                     stderr=log_file,
                 )
                 _active_ffmpeg[0] = self.recording_process
-                self.recording_process.wait()
+                # Poll so end_dt and stop_event are checked even if ffmpeg hangs
+                while self.recording_process.poll() is None:
+                    if self.stop_event.is_set() or datetime.now(timezone.utc) >= end_dt:
+                        print("[INFO] Terminating hung/overdue ffmpeg chunk...")
+                        self.recording_process.terminate()
+                        self.recording_process.wait()
+                        break
+                    time.sleep(1)
                 _active_ffmpeg[0] = None
                 rc = self.recording_process.returncode
                 print(f"[DEBUG] ffmpeg chunk finished, rc={rc}")
