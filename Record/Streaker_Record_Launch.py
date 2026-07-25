@@ -15,7 +15,6 @@ import time
 import json
 from astral import LocationInfo
 from astral.sun import sun, elevation, dawn, dusk
-import pytz
 
 
 def _find_ffmpeg():
@@ -89,6 +88,7 @@ def _kill_ffmpeg_on_exit():
             proc.wait(timeout=5)
         except Exception:
             proc.kill()
+            proc.wait()
     log_file.flush()
 
 # Timestamped print
@@ -155,6 +155,7 @@ class StreamCapture:
             except Exception:
                 print("[WARNING] ffmpeg did not stop in 5s — killing")
                 proc.kill()
+                proc.wait()  # ensure fully dead before PyInstaller cleanup
         log_file.flush()
         self.root.destroy()
 
