@@ -15,6 +15,11 @@
 
 import tkinter as tk
 from tkinter import filedialog, messagebox
+_mb_showerror   = messagebox.showerror
+_mb_showwarning = messagebox.showwarning
+_CTRLC_TIP = "\n\nTip: press Ctrl+C to copy this message."
+messagebox.showerror   = lambda t, m, **k: _mb_showerror(t, str(m) + _CTRLC_TIP, **k)
+messagebox.showwarning = lambda t, m, **k: _mb_showwarning(t, str(m) + _CTRLC_TIP, **k)
 import json
 import os
 from datetime import datetime, timedelta, timezone

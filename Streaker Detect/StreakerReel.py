@@ -14,6 +14,11 @@ import tempfile
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+_mb_showerror   = messagebox.showerror
+_mb_showwarning = messagebox.showwarning
+_CTRLC_TIP = "\n\nTip: press Ctrl+C to copy this message."
+messagebox.showerror   = lambda t, m, **k: _mb_showerror(t, str(m) + _CTRLC_TIP, **k)
+messagebox.showwarning = lambda t, m, **k: _mb_showwarning(t, str(m) + _CTRLC_TIP, **k)
 
 from platform_utils import FFMPEG_PATH, NO_WINDOW
 

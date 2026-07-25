@@ -10,6 +10,11 @@ import cv2
 import numpy as np
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+_mb_showerror   = messagebox.showerror
+_mb_showwarning = messagebox.showwarning
+_CTRLC_TIP = "\n\nTip: press Ctrl+C to copy this message."
+messagebox.showerror   = lambda t, m, **k: _mb_showerror(t, str(m) + _CTRLC_TIP, **k)
+messagebox.showwarning = lambda t, m, **k: _mb_showwarning(t, str(m) + _CTRLC_TIP, **k)
 from PIL import Image, ImageTk
 import threading
 import queue
