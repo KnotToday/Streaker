@@ -40,6 +40,11 @@ _DISPLAY_DIR = _REPO / "Streaker_Display"
 _DISPLAY_EXE = _DISPLAY_DIR / "dist" / "StreakerDisplay.exe"
 _DISPLAY_PY  = _DISPLAY_DIR / "StreakerDisplay.py"
 
+_TLE_DIR = _REPO / "Get_TLE"
+_TLE_EXE = _TLE_DIR / "dist" / "GetTLE.exe"
+_TLE_PY  = _TLE_DIR / "get_tle.py"
+
+TASK_NAME = "StreakerGetTLE"
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
 # ---------------------------------------------------------------------------
@@ -73,6 +78,8 @@ _DEFAULT_CFG = {
     "output_dir": "D:/",
     "opensky_username": "",
     "opensky_password": "",
+    "spacetrack_username": "",
+    "spacetrack_password": "",
 }
 
 def _load_config():
@@ -255,6 +262,16 @@ class SkyEye:
 
         sep()
 
+        # TLE downloader
+        self._tle_dot = self._dot_label(parent)
+        self._tle_dot.pack(side='top', anchor='w', padx=10, pady=(4, 0))
+        tk.Button(parent, text="🛰  Schedule TLEs", command=self._tle_schedule,
+                  **BTN_H, padx=10, pady=6, anchor='w').pack(fill='x', padx=10, pady=(2, 0))
+        tk.Button(parent, text="⬇  Download Now", command=self._tle_download_now,
+                  **BTN_H, padx=10, pady=6, anchor='w').pack(fill='x', padx=10, pady=(0, 0))
+
+        sep()
+
         # Preview toggle
         self._prev_btn = tk.Button(parent, text="▶  Live Preview",
                                    command=self._toggle_preview,
@@ -422,6 +439,86 @@ class SkyEye:
                 lbl.config(text=f"● {label}", fg=GREEN)
             else:
                 lbl.config(text=f"● {label}", fg=FG2)
+        self._update_tle_dot()
+
+    def _update_tle_dot(self):
+        scheduled = self._tle_task_exists()
+        if scheduled:
+            self._tle_dot.config(text="● TLE Scheduled", fg=GREEN)
+        else:
+            self._tle_dot.config(text="● TLE Not scheduled", fg=YELLOW)
+
+    def _tle_task_exists(self) -> bool:
+        try:
+            r = subprocess.run(
+                ["schtasks", "/query", "/tn", TASK_NAME],
+                capture_output=True, creationflags=NO_WINDOW
+            )
+            return r.returncode == 0
+        except Exception:
+            return False
+
+    def _write_tle_config(self) -> bool:
+        username = self.cfg.get("spacetrack_username", "").strip()
+        password = self.cfg.get("spacetrack_password", "").strip()
+        if not username or not password:
+            messagebox.showwarning("No Credentials",
+                "Enter your space-track.org username and password in Settings first.")
+            return False
+        # Write next to whichever GetTLE target will actually run
+        if _TLE_EXE.exists():
+            cfg_path = _TLE_EXE.parent / "tle_config.json"
+        else:
+            cfg_path = _TLE_DIR / "tle_config.json"
+        with open(cfg_path, "w") as f:
+            json.dump({
+                "username": username,
+                "password": password,
+                "save_dir": "TLEz",
+            }, f, indent=2)
+        return True
+
+    def _tle_schedule(self):
+        if not self._write_tle_config():
+            return
+        if _TLE_EXE.exists():
+            exe = str(_TLE_EXE)
+        else:
+            messagebox.showerror("Not Found",
+                f"GetTLE.exe not found at:\n  {_TLE_EXE}")
+            return
+        try:
+            subprocess.run([
+                "schtasks", "/create", "/tn", TASK_NAME,
+                "/tr", exe,
+                "/sc", "daily",
+                "/st", "20:00",
+                "/f",   # overwrite if exists
+            ], check=True, capture_output=True, creationflags=NO_WINDOW)
+            self._update_tle_dot()
+            self._status("TLE download scheduled daily at 20:00.")
+            messagebox.showinfo("Scheduled",
+                "TLE download scheduled: daily at 20:00.\n"
+                "GetTLE.exe will run automatically even when SkyEye is closed.")
+        except subprocess.CalledProcessError as e:
+            messagebox.showerror("Schedule Failed", e.stderr.decode(errors='replace'))
+
+    def _tle_download_now(self):
+        if not self._write_tle_config():
+            return
+        if _TLE_EXE.exists():
+            cmd = [str(_TLE_EXE)]
+            cwd = str(_TLE_EXE.parent)
+        elif _TLE_PY.exists():
+            cmd = [sys.executable, str(_TLE_PY)]
+            cwd = str(_TLE_DIR)
+        else:
+            messagebox.showerror("Not Found",
+                f"Could not find GetTLE.\nLooked for:\n  {_TLE_EXE}\n  {_TLE_PY}")
+            return
+        # Console window intentional — user sees download progress
+        subprocess.Popen(cmd, cwd=cwd)
+        self._status("TLE download started — a console window will show progress.")
 
     # ------------------------------------------------------------------
     # Settings dialog
@@ -434,10 +531,12 @@ class SkyEye:
         win.grab_set()
 
         fields = [
-            ("Latitude",          "latitude",           20, False),
-            ("Longitude",         "longitude",          20, False),
-            ("OpenSky Username",  "opensky_username",   30, False),
-            ("OpenSky Password",  "opensky_password",   30, True),
+            ("Latitude",               "latitude",              20, False),
+            ("Longitude",              "longitude",             20, False),
+            ("OpenSky Username",       "opensky_username",      30, False),
+            ("OpenSky Password",       "opensky_password",      30, True),
+            ("Space-Track Username",   "spacetrack_username",   30, False),
+            ("Space-Track Password",   "spacetrack_password",   30, True),
         ]
 
         vars_ = {}

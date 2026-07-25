@@ -14,7 +14,6 @@ First-time setup — create tle_config.json next to this script:
 Schedule via Windows Task Scheduler or Linux cron to run once daily.
 """
 
-import os
 import sys
 import json
 import socket
@@ -28,7 +27,10 @@ try:
 except ImportError:
     sys.exit("requests is required:  pip install requests")
 
-BASE_DIR    = Path(__file__).parent
+if getattr(sys, 'frozen', False):
+    BASE_DIR = Path(sys.executable).parent
+else:
+    BASE_DIR = Path(__file__).parent
 CONFIG_FILE = BASE_DIR / "tle_config.json"
 LOG_FILE    = BASE_DIR / f"get_tle_{datetime.now().strftime('%Y%m%d')}.log"
 

@@ -23,10 +23,14 @@
 /Streaker Detect/shared_config.json
 /Streaker Detect/streaker_astro_config.json
 
-# Get_TLE — exclude credentials, downloaded TLE data, and logs
+# Get_TLE — exclude credentials, downloaded TLE data, and build artifacts
 /Get_TLE/tle_config.json
 /Get_TLE/TLEz/
 /Get_TLE/*.log
+/Get_TLE/build/
+/Get_TLE/dist/
+/Get_TLE/__pycache__/
+/Get_TLE/*.pyc
 
 # Record — exclude credentials, build artifacts, and logs
 /Record/stream_capture_config.json
