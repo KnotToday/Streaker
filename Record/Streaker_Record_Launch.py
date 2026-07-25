@@ -285,8 +285,10 @@ class StreamCapture:
                 import ctypes
                 ctypes.windll.kernel32.SetThreadExecutionState(0x80000000)  # ES_CONTINUOUS — release keep-awake
             self.timer_label.set("Recording Complete")
+            self.root.after(0, self._enable_start_buttons)
 
         self.stop_event.clear()
+        self._disable_start_buttons()
         Thread(target=record, daemon=True).start()
 
     def build_gui(self):
@@ -345,8 +347,10 @@ class StreamCapture:
         Label(self.root, textvariable=self.timer_label, font=("Arial", 14), fg="red").grid(row=9, column=0, columnspan=3)
         Label(self.root, textvariable=self.mode_label, font=("Arial", 10), fg="blue").grid(row=10, column=0, columnspan=3)
 
-        Button(self.root, text="Start Now", command=self.start_now).grid(row=11, column=0)
-        Button(self.root, text="Start with Delay", command=self.start_with_delay).grid(row=11, column=1)
+        self._btn_start_now = Button(self.root, text="Start Now", command=self.start_now)
+        self._btn_start_now.grid(row=11, column=0)
+        self._btn_start_delay = Button(self.root, text="Start with Delay", command=self.start_with_delay)
+        self._btn_start_delay.grid(row=11, column=1)
         Button(self.root, text="Force Stop", command=self.force_stop_capture).grid(row=11, column=2)
 
         self.display_twilight_times()
@@ -601,11 +605,20 @@ class StreamCapture:
 
         return base_time  # fallback
 
+    def _disable_start_buttons(self):
+        self._btn_start_now.config(state='disabled')
+        self._btn_start_delay.config(state='disabled')
+
+    def _enable_start_buttons(self):
+        self._btn_start_now.config(state='normal')
+        self._btn_start_delay.config(state='normal')
+
     def force_stop_capture(self):
         self.stop_event.set()
         self.timer_label.set("Force Stopped")
         if self.recording_process:
             self.recording_process.terminate()
+        self._enable_start_buttons()
 
 
 if __name__ == "__main__":
