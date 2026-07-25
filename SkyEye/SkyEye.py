@@ -241,24 +241,30 @@ class SkyEye:
         # Recording
         self._rec_dot = self._dot_label(parent)
         self._rec_dot.pack(side='top', anchor='w', padx=10, pady=(8, 0))
-        tk.Button(parent, text="⏺  Start Recording", command=self._launch_record,
-                  **BTN_H, padx=10, pady=8, anchor='w').pack(fill='x', padx=10, pady=(2, 0))
+        self._rec_btn = tk.Button(parent, text="⏺  Start Recording",
+                                  command=self._launch_record,
+                                  **BTN_H, padx=10, pady=8, anchor='w')
+        self._rec_btn.pack(fill='x', padx=10, pady=(2, 0))
 
         sep()
 
         # Detection
         self._det_dot = self._dot_label(parent)
         self._det_dot.pack(side='top', anchor='w', padx=10, pady=(4, 0))
-        tk.Button(parent, text="🔍  Run Detection", command=self._launch_detect,
-                  **BTN_H, padx=10, pady=8, anchor='w').pack(fill='x', padx=10, pady=(2, 0))
+        self._det_btn = tk.Button(parent, text="🔍  Run Detection",
+                                  command=self._launch_detect,
+                                  **BTN_H, padx=10, pady=8, anchor='w')
+        self._det_btn.pack(fill='x', padx=10, pady=(2, 0))
 
         sep()
 
         # Camera display
         self._disp_dot = self._dot_label(parent)
         self._disp_dot.pack(side='top', anchor='w', padx=10, pady=(4, 0))
-        tk.Button(parent, text="📷  Camera Display", command=self._launch_display,
-                  **BTN_H, padx=10, pady=8, anchor='w').pack(fill='x', padx=10, pady=(2, 0))
+        self._disp_btn = tk.Button(parent, text="📷  Camera Display",
+                                   command=self._launch_display,
+                                   **BTN_H, padx=10, pady=8, anchor='w')
+        self._disp_btn.pack(fill='x', padx=10, pady=(2, 0))
 
         sep()
 
@@ -428,17 +434,16 @@ class SkyEye:
     # Status indicators
     # ------------------------------------------------------------------
     def _update_status_indicators(self):
-        pairs = [
-            (self._rec_dot,  "STREAKERrec",      "Recording"),
-            (self._det_dot,  "StreakerDetect",    "Detection"),
-            (self._disp_dot, "StreakerDisplay",   "Camera Display"),
+        triples = [
+            (self._rec_dot,  self._rec_btn,  "STREAKERrec",    "Recording"),
+            (self._det_dot,  self._det_btn,  "StreakerDetect",  "Detection"),
+            (self._disp_dot, self._disp_btn, "StreakerDisplay", "Camera Display"),
         ]
-        for lbl, name, label in pairs:
+        for lbl, btn, name, label in triples:
             proc = self._processes.get(name)
-            if proc and proc.poll() is None:
-                lbl.config(text=f"● {label}", fg=GREEN)
-            else:
-                lbl.config(text=f"● {label}", fg=FG2)
+            running = proc and proc.poll() is None
+            lbl.config(text=f"● {label}", fg=GREEN if running else FG2)
+            btn.config(state='disabled' if running else 'normal')
         self._update_tle_dot()
 
     def _update_tle_dot(self):
