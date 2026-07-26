@@ -463,6 +463,7 @@ _HELP_LINES = [
     ("2", "CAM2 solo  (again to return)"),
     ("0", "dual view"),
     ("c", "compare/live solo toggle"),
+    ("w", "fit window to frame size"),
     ("f", "fullscreen"),
     ("s", "settings"),
     ("r", "reconnect streams"),
@@ -541,11 +542,11 @@ def main(force_settings=False):
         log.info("%s → %s", cam.get("label"), "sub-stream" if (use_sub and sub) else "main stream")
 
     screen_width, screen_height = get_screen_size()
+    win_x = cfg.get("window_x", (screen_width  - window_width)  // 2)
+    win_y = cfg.get("window_y", (screen_height - window_height) // 2)
     cv2.namedWindow("Streaker Live Feed", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("Streaker Live Feed", window_width, window_height)
-    cv2.moveWindow("Streaker Live Feed",
-                   screen_width - window_width,
-                   (screen_height - window_height) // 2)
+    cv2.moveWindow("Streaker Live Feed", win_x, win_y)
 
     queues          = [queue.Queue(maxsize=QUEUE_SIZE) for _ in cameras]
     reconn          = [threading.Event()               for _ in cameras]
@@ -774,6 +775,14 @@ def main(force_settings=False):
                             _stop_cam(hidden)
             elif key & 0xFF == ord("h"):
                 show_help = not show_help
+            elif key & 0xFF == ord("w"):
+                ref = last_good[solo - 1] if solo != 0 else next(
+                    (f for f in last_good if f is not None), None)
+                if ref is not None:
+                    fh, fw = ref.shape[:2]
+                    new_h = fh if solo != 0 else min(fh * 2, screen_height - 80)
+                    cv2.resizeWindow("Streaker Live Feed", fw, new_h)
+                    log.info("Fit window to frame: %dx%d", fw, new_h)
             elif key & 0xFF == ord("r"):
                 for i, ev in enumerate(force_reconnect):
                     if threads[i] and threads[i].is_alive():
@@ -786,6 +795,18 @@ def main(force_settings=False):
                 log.info("Screenshot saved: %s", shot_path)
 
     finally:
+        # Save window position and size so next launch opens in the same place
+        try:
+            rx, ry, rw, rh = cv2.getWindowImageRect("Streaker Live Feed")
+            if rw > 0 and rh > 0:
+                saved = _load_config()
+                saved["window_x"]      = rx
+                saved["window_y"]      = ry
+                saved["window_width"]  = rw
+                saved["window_height"] = rh
+                _save_config(saved)
+        except Exception as e:
+            log.warning("Could not save window position: %s", e)
         for i in range(len(cameras)):
             cam_stop[i].set()
         for t in threads:
