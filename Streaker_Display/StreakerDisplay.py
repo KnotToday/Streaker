@@ -698,14 +698,6 @@ def main(force_settings=False):
                         _draw_label(combined, labels[idx])
                         if reconn[idx].is_set():
                             _draw_reconnecting(combined, win_w, win_h)
-                        # Mode indicator — top-right corner
-                        mode_txt   = "COMPARE" if compare_mode else "LIVE"
-                        mode_color = (0, 180, 255) if compare_mode else (0, 210, 0)
-                        (mw, mh), _ = cv2.getTextSize(mode_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
-                        mx = win_w - mw - 8
-                        my = 20
-                        cv2.putText(combined, mode_txt, (mx, my), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,0,0),      2, cv2.LINE_AA)
-                        cv2.putText(combined, mode_txt, (mx, my), cv2.FONT_HERSHEY_SIMPLEX, 0.45, mode_color,   1, cv2.LINE_AA)
                 else:
                     # Dual stacked view
                     for i, frame in enumerate(frames):
@@ -733,6 +725,14 @@ def main(force_settings=False):
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0),  2, cv2.LINE_AA)
                     cv2.putText(combined, sync_text, (tx, ty),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, sync_color, 1, cv2.LINE_AA)
+
+                # Mode indicator — always visible, top-right corner
+                mode_txt   = "COMPARE" if compare_mode else "LIVE"
+                mode_color = (0, 180, 255) if compare_mode else (0, 210, 0)
+                (mw, mh), _ = cv2.getTextSize(mode_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+                mx, my = win_w - mw - 8, 20
+                cv2.putText(combined, mode_txt, (mx, my), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0),    2, cv2.LINE_AA)
+                cv2.putText(combined, mode_txt, (mx, my), cv2.FONT_HERSHEY_SIMPLEX, 0.45, mode_color,   1, cv2.LINE_AA)
 
                 if show_help:
                     _draw_help(combined)
@@ -792,9 +792,21 @@ def main(force_settings=False):
                     (f for f in last_good if f is not None), None)
                 if ref is not None:
                     fh, fw = ref.shape[:2]
-                    new_h = fh if solo != 0 else min(fh * 2, screen_height - 80)
-                    cv2.resizeWindow("Streaker Live Feed", fw, new_h)
-                    log.info("Fit window to frame: %dx%d", fw, new_h)
+                    max_h  = screen_height - 80
+                    if solo != 0:
+                        new_w, new_h = fw, fh
+                    else:
+                        # dual stacked: ideal is fw x fh*2, but cap to screen height
+                        ideal_h = fh * 2
+                        if ideal_h <= max_h:
+                            new_w, new_h = fw, ideal_h
+                        else:
+                            # scale down proportionally so it fits on one screen
+                            scale  = max_h / ideal_h
+                            new_w  = int(fw * scale) & ~1
+                            new_h  = max_h
+                    cv2.resizeWindow("Streaker Live Feed", new_w, new_h)
+                    log.info("Fit window to frame: %dx%d", new_w, new_h)
             elif key & 0xFF == ord("r"):
                 for i, ev in enumerate(force_reconnect):
                     if threads[i] and threads[i].is_alive():
