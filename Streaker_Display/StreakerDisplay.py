@@ -547,6 +547,10 @@ def main(force_settings=False):
     cv2.namedWindow("Streaker Live Feed", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("Streaker Live Feed", window_width, window_height)
     cv2.moveWindow("Streaker Live Feed", win_x, win_y)
+    _TITLE_HINTS = ("Streaker Live Feed  |  "
+                    "1/2: solo  0: dual  c: compare/live  w: fit  "
+                    "f: fullscreen  s: settings  r: reconnect  p: screenshot  h: help  q: quit")
+    cv2.setWindowTitle("Streaker Live Feed", _TITLE_HINTS)
 
     queues          = [queue.Queue(maxsize=QUEUE_SIZE) for _ in cameras]
     reconn          = [threading.Event()               for _ in cameras]
@@ -732,6 +736,14 @@ def main(force_settings=False):
 
                 if show_help:
                     _draw_help(combined)
+
+                if fullscreen_mode:
+                    fs_txt = "f: exit fullscreen"
+                    (fsw, fsh), _ = cv2.getTextSize(fs_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+                    cv2.putText(combined, fs_txt, (win_w - fsw - 8, win_h - 8),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0),       2, cv2.LINE_AA)
+                    cv2.putText(combined, fs_txt, (win_w - fsw - 8, win_h - 8),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1, cv2.LINE_AA)
 
                 cv2.imshow("Streaker Live Feed", combined)
                 last_display_time = now
