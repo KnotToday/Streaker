@@ -462,6 +462,7 @@ _HELP_LINES = [
     ("1", "CAM1 solo  (again to return)"),
     ("2", "CAM2 solo  (again to return)"),
     ("0", "dual view"),
+    ("c", "compare/live solo toggle"),
     ("f", "fullscreen"),
     ("s", "settings"),
     ("r", "reconnect streams"),
@@ -546,19 +547,33 @@ def main(force_settings=False):
                    screen_width - window_width,
                    (screen_height - window_height) // 2)
 
-    stop_event      = threading.Event()
     queues          = [queue.Queue(maxsize=QUEUE_SIZE) for _ in cameras]
     reconn          = [threading.Event()               for _ in cameras]
     force_reconnect = [threading.Event()               for _ in cameras]
-    threads         = [
-        threading.Thread(target=frame_reader,
-                         args=(queues[i], stop_event, display_urls[i], reconn[i], force_reconnect[i]),
-                         kwargs={'display_resolution': display_resolution},
-                         daemon=True)
-        for i in range(len(cameras))
-    ]
-    for t in threads:
+    cam_stop        = [threading.Event()               for _ in cameras]
+    threads         = [None] * len(cameras)
+
+    def _start_cam(i):
+        cam_stop[i].clear()
+        while not queues[i].empty():
+            try: queues[i].get_nowait()
+            except queue.Empty: break
+        sync_bufs[i].clear()
+        reconn[i].set()
+        t = threading.Thread(
+            target=frame_reader,
+            args=(queues[i], cam_stop[i], display_urls[i], reconn[i], force_reconnect[i]),
+            kwargs={'display_resolution': display_resolution},
+            daemon=True,
+        )
         t.start()
+        return t
+
+    def _stop_cam(i):
+        cam_stop[i].set()
+        if threads[i] and threads[i].is_alive():
+            threads[i].join(timeout=3)
+        threads[i] = None
 
     th, bh     = _pane_heights(window_height)
     pane_bufs  = [np.zeros((th, window_width, 3), dtype=np.uint8),
@@ -568,6 +583,9 @@ def main(force_settings=False):
     sync_bufs  = [deque(maxlen=SYNC_BUFFER), deque(maxlen=SYNC_BUFFER)]
     last_good  = [None, None]
     delta_ms   = 0.0
+
+    for i in range(len(cameras)):
+        threads[i] = _start_cam(i)
 
     screenshot_dir = Path(__file__).parent / "screenshots"
     screenshot_dir.mkdir(exist_ok=True)
@@ -579,15 +597,36 @@ def main(force_settings=False):
         fullscreen_mode      = False
         _prev_fullscreen     = None   # track last applied state to avoid redundant setWindowProperty
         reopen_settings      = False
-        solo      = 0      # 0=both, 1=CAM1 only, 2=CAM2 only
-        show_help = False
+        solo         = 0      # 0=both, 1=CAM1 only, 2=CAM2 only
+        compare_mode = True   # True=both streams run (instant switch); False=hidden cam pauses (saves CPU)
+        show_help    = False
+
+        def _apply_solo(new_solo):
+            nonlocal solo
+            solo = new_solo
+            if compare_mode:
+                return
+            if new_solo == 0:
+                # returning to dual — restart any paused cameras
+                for i in range(len(cameras)):
+                    if not threads[i] or not threads[i].is_alive():
+                        threads[i] = _start_cam(i)
+            else:
+                # going solo — pause the hidden camera, ensure active is running
+                hidden = new_solo % 2        # solo=1 → hidden idx 1; solo=2 → hidden idx 0
+                active = 1 - hidden
+                if threads[hidden] and threads[hidden].is_alive():
+                    _stop_cam(hidden)
+                if not threads[active] or not threads[active].is_alive():
+                    threads[active] = _start_cam(active)
 
         while True:
             if reopen_settings:
                 reopen_settings = False
-                stop_event.set()
+                for i in range(len(cameras)):
+                    cam_stop[i].set()
                 for t in threads:
-                    t.join(timeout=2)
+                    if t: t.join(timeout=2)
                 cv2.destroyAllWindows()
                 if CURSOR_HIDDEN and sys.platform == "win32":
                     ctypes.windll.user32.ShowCursor(True)
@@ -654,6 +693,14 @@ def main(force_settings=False):
                         _draw_label(combined, labels[idx])
                         if reconn[idx].is_set():
                             _draw_reconnecting(combined, win_w, win_h)
+                        # Mode indicator — top-right corner
+                        mode_txt   = "COMPARE" if compare_mode else "LIVE"
+                        mode_color = (0, 180, 255) if compare_mode else (0, 210, 0)
+                        (mw, mh), _ = cv2.getTextSize(mode_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+                        mx = win_w - mw - 8
+                        my = 20
+                        cv2.putText(combined, mode_txt, (mx, my), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,0,0),      2, cv2.LINE_AA)
+                        cv2.putText(combined, mode_txt, (mx, my), cv2.FONT_HERSHEY_SIMPLEX, 0.45, mode_color,   1, cv2.LINE_AA)
                 else:
                     # Dual stacked view
                     for i, frame in enumerate(frames):
@@ -702,19 +749,35 @@ def main(force_settings=False):
                 log.info("Settings key pressed.")
                 reopen_settings = True
             elif key & 0xFF == ord("1"):
-                solo = 0 if solo == 1 else 1
+                new = 0 if solo == 1 else 1
+                _apply_solo(new)
                 log.info("Solo: %s", labels[0] if solo == 1 else "both")
             elif key & 0xFF == ord("2"):
-                solo = 0 if solo == 2 else 2
+                new = 0 if solo == 2 else 2
+                _apply_solo(new)
                 log.info("Solo: %s", labels[1] if solo == 2 else "both")
             elif key & 0xFF == ord("0"):
-                solo = 0
+                _apply_solo(0)
                 log.info("Solo: both")
+            elif key & 0xFF == ord("c"):
+                compare_mode = not compare_mode
+                log.info("Solo mode: %s", "compare" if compare_mode else "live")
+                if solo != 0:
+                    hidden = solo % 2
+                    if compare_mode:
+                        # switched to compare — restart hidden cam if paused
+                        if not threads[hidden] or not threads[hidden].is_alive():
+                            threads[hidden] = _start_cam(hidden)
+                    else:
+                        # switched to live — pause hidden cam
+                        if threads[hidden] and threads[hidden].is_alive():
+                            _stop_cam(hidden)
             elif key & 0xFF == ord("h"):
                 show_help = not show_help
             elif key & 0xFF == ord("r"):
-                for ev in force_reconnect:
-                    ev.set()
+                for i, ev in enumerate(force_reconnect):
+                    if threads[i] and threads[i].is_alive():
+                        ev.set()
                 log.info("Force-reconnect all streams.")
             elif key & 0xFF == ord("p"):
                 ts        = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -723,9 +786,10 @@ def main(force_settings=False):
                 log.info("Screenshot saved: %s", shot_path)
 
     finally:
-        stop_event.set()
+        for i in range(len(cameras)):
+            cam_stop[i].set()
         for t in threads:
-            t.join(timeout=3)
+            if t: t.join(timeout=3)
         cv2.destroyAllWindows()
         if CURSOR_HIDDEN and sys.platform == "win32":
             ctypes.windll.user32.ShowCursor(True)
