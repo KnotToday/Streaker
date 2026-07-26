@@ -576,8 +576,9 @@ def main(force_settings=False):
     frame_interval    = 1.0 / 24
 
     try:
-        fullscreen_mode = False
-        reopen_settings = False
+        fullscreen_mode      = False
+        _prev_fullscreen     = None   # track last applied state to avoid redundant setWindowProperty
+        reopen_settings      = False
         solo      = 0      # 0=both, 1=CAM1 only, 2=CAM2 only
         show_help = False
 
@@ -598,16 +599,20 @@ def main(force_settings=False):
                 log.info("Window closed by user.")
                 break
 
-            if fullscreen_mode:
-                cv2.setWindowProperty("Streaker Live Feed", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
-                if not CURSOR_HIDDEN and sys.platform == "win32":
-                    ctypes.windll.user32.ShowCursor(False)
-                    CURSOR_HIDDEN = True
-            else:
-                cv2.setWindowProperty("Streaker Live Feed", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
-                if CURSOR_HIDDEN and sys.platform == "win32":
-                    ctypes.windll.user32.ShowCursor(True)
-                    CURSOR_HIDDEN = False
+            # Only apply fullscreen property when state actually changes — calling
+            # setWindowProperty every frame floods the Windows message queue.
+            if fullscreen_mode != _prev_fullscreen:
+                if fullscreen_mode:
+                    cv2.setWindowProperty("Streaker Live Feed", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+                    if not CURSOR_HIDDEN and sys.platform == "win32":
+                        ctypes.windll.user32.ShowCursor(False)
+                        CURSOR_HIDDEN = True
+                else:
+                    cv2.setWindowProperty("Streaker Live Feed", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
+                    if CURSOR_HIDDEN and sys.platform == "win32":
+                        ctypes.windll.user32.ShowCursor(True)
+                        CURSOR_HIDDEN = False
+                _prev_fullscreen = fullscreen_mode
 
             _, _, win_w, win_h = cv2.getWindowImageRect("Streaker Live Feed")
             if win_w <= 0 or win_h <= 0:
@@ -683,7 +688,11 @@ def main(force_settings=False):
                 cv2.imshow("Streaker Live Feed", combined)
                 last_display_time = now
 
-            key = cv2.waitKey(1)
+            # Sleep for remaining time until next frame — avoids spinning at ~1000fps
+            # which wastes CPU and can starve the Windows message pump.
+            elapsed  = time.monotonic() - last_display_time
+            wait_ms  = max(1, int((frame_interval - elapsed) * 1000))
+            key = cv2.waitKey(min(wait_ms, 16))
             if key & 0xFF == ord("q"):
                 log.info("Quit key pressed.")
                 break
