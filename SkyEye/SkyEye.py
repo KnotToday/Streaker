@@ -497,13 +497,15 @@ class SkyEye:
             messagebox.showerror("Not Found",
                 f"GetTLE.exe not found at:\n  {_TLE_EXE}")
             return
+        username = os.environ.get("USERNAME") or os.environ.get("USER", "")
         try:
             subprocess.run([
                 "schtasks", "/create", "/tn", TASK_NAME,
                 "/tr", exe,
                 "/sc", "daily",
                 "/st", "20:00",
-                "/f",   # overwrite if exists
+                "/ru", username,   # run in logged-on user session, not Session 0
+                "/f",              # overwrite if exists
             ], check=True, capture_output=True, creationflags=NO_WINDOW)
             self._update_tle_dot()
             self._status("TLE download scheduled daily at 20:00.")
