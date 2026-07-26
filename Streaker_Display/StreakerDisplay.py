@@ -605,6 +605,8 @@ def main(force_settings=False):
         solo         = 0      # 0=both, 1=CAM1 only, 2=CAM2 only
         compare_mode = True   # True=both streams run (instant switch); False=hidden cam pauses (saves CPU)
         show_help    = False
+        last_input_t = time.monotonic()
+        _IDLE_TIMEOUT = 60.0   # seconds of no input before auto-switching to live mode
 
         def _apply_solo(new_solo):
             nonlocal solo
@@ -726,6 +728,26 @@ def main(force_settings=False):
                     cv2.putText(combined, sync_text, (tx, ty),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, sync_color, 1, cv2.LINE_AA)
 
+                # Idle countdown — solo + compare mode only
+                if solo != 0 and compare_mode:
+                    idle = time.monotonic() - last_input_t
+                    if idle >= _IDLE_TIMEOUT:
+                        # Time's up — pause hidden cam and switch to live mode
+                        hidden = solo % 2
+                        if threads[hidden] and threads[hidden].is_alive():
+                            _stop_cam(hidden)
+                        compare_mode = False
+                        last_input_t = time.monotonic()
+                        log.info("Idle timeout — switched to live mode, hidden cam paused.")
+                    elif idle >= _IDLE_TIMEOUT - 5:
+                        secs_left = int(_IDLE_TIMEOUT - idle) + 1
+                        cd_txt = f"Switching to LIVE in {secs_left}s  (any key cancels)"
+                        (cdw, cdh), _ = cv2.getTextSize(cd_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                        cx = (win_w - cdw) // 2
+                        cy = win_h - 20
+                        cv2.putText(combined, cd_txt, (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0),       2, cv2.LINE_AA)
+                        cv2.putText(combined, cd_txt, (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255),   1, cv2.LINE_AA)
+
                 # Mode indicator — always visible, top-right corner
                 mode_txt   = "COMPARE" if compare_mode else "LIVE"
                 mode_color = (0, 180, 255) if compare_mode else (0, 210, 0)
@@ -753,6 +775,8 @@ def main(force_settings=False):
             elapsed  = time.monotonic() - last_display_time
             wait_ms  = max(1, int((frame_interval - elapsed) * 1000))
             key = cv2.waitKey(min(wait_ms, 16))
+            if key != -1:
+                last_input_t = time.monotonic()
             if key & 0xFF == ord("q"):
                 log.info("Quit key pressed.")
                 break
