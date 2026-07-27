@@ -317,7 +317,10 @@ def frame_reader(frame_queue, stop_event, display_url, reconnecting_event, force
             creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0,
         )
 
-    proc = None
+    WATCHDOG       = 15.0   # seconds without a frame before auto-reconnect
+    proc           = None
+    pipe_q         = None   # per-connection queue fed by a dedicated reader thread
+    last_frame_t   = time.monotonic()
     try:
         while not stop_event.is_set():
             if force_reconnect_event.is_set():
@@ -328,6 +331,7 @@ def frame_reader(frame_queue, stop_event, display_url, reconnecting_event, force
                     proc.kill()
                     proc.wait()
                     proc = None
+                pipe_q = None
                 time.sleep(0.5)
 
             if proc is None:
@@ -335,19 +339,42 @@ def frame_reader(frame_queue, stop_event, display_url, reconnecting_event, force
                 try:
                     proc = launch()
                     log.info("ffmpeg display started (PID %d).", proc.pid)
+                    last_frame_t = time.monotonic()  # reset watchdog on new connection
+                    # Dedicated reader thread so proc.stdout.read() can't block
+                    # the main loop — stop/reconnect events are checked every 0.1s.
+                    pipe_q = queue.Queue()
+                    def _read_pipe(stdout, q, chunk_size=CHUNK):
+                        try:
+                            while True:
+                                chunk = stdout.read(chunk_size)
+                                q.put(chunk if chunk else b"")
+                                if not chunk:
+                                    return
+                        except Exception:
+                            q.put(b"")
+                    threading.Thread(target=_read_pipe,
+                                     args=(proc.stdout, pipe_q),
+                                     daemon=True).start()
                 except Exception as e:
                     log.error("Failed to launch ffmpeg: %s", e)
                     time.sleep(2.0)
                     continue
 
-            # Read one frame in chunks so stop/reconnect events are checked frequently
+            # Accumulate bytes for one full frame; poll pipe_q so stop/reconnect
+            # events and the watchdog are never more than 0.1 s away from firing.
             buf      = bytearray()
             pipe_ok  = True
             while len(buf) < FRAME_BYTES:
                 if stop_event.is_set() or force_reconnect_event.is_set():
                     pipe_ok = False
                     break
-                chunk = proc.stdout.read(min(CHUNK, FRAME_BYTES - len(buf)))
+                try:
+                    chunk = pipe_q.get(timeout=0.1)
+                except queue.Empty:
+                    if time.monotonic() - last_frame_t > WATCHDOG:
+                        log.warning("Watchdog: no frame in %.0fs — forcing reconnect.", WATCHDOG)
+                        pipe_ok = False
+                    continue
                 if not chunk:
                     pipe_ok = False
                     break
@@ -360,9 +387,11 @@ def frame_reader(frame_queue, stop_event, display_url, reconnecting_event, force
                     proc.kill()
                     proc.wait()
                     proc = None
+                    pipe_q = None
                     time.sleep(0.5)
                 continue
 
+            last_frame_t = time.monotonic()
             reconnecting_event.clear()
             frame = np.frombuffer(buf, dtype=np.uint8).reshape((PIPE_H, PIPE_W, 3)).copy()
             item  = (time.monotonic(), frame)

@@ -3159,10 +3159,15 @@ class StreakerDetectApp:
         print(f"[DETECT] view_clip event_dir={event_dir!r}")
         print(f"[DETECT] view_clip source_clip={source_clip!r} isfile={os.path.isfile(source_clip) if source_clip else 'N/A'}")
         print(f"[DETECT] view_clip run_folder={run_folder!r} isdir={os.path.isdir(run_folder)}")
-        if source_clip and os.path.isfile(source_clip):
-            launch_player(initial_folder=run_folder, mkv_path=source_clip)
-        else:
-            launch_player(initial_folder=run_folder)
+        try:
+            if source_clip and os.path.isfile(source_clip):
+                launch_player(initial_folder=run_folder, mkv_path=source_clip)
+            else:
+                launch_player(initial_folder=run_folder)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            messagebox.showerror("Player Error", f"Failed to open player:\n{e}")
 
     def _launch_player(self):
         if not _PLAYER_AVAILABLE:
@@ -3182,7 +3187,12 @@ class StreakerDetectApp:
                 initialdir=initial, parent=self.root)
             if not folder:
                 return
-        launch_player(initial_folder=folder)
+        try:
+            launch_player(initial_folder=folder)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            messagebox.showerror("Player Error", f"Failed to open player:\n{e}")
 
     def _launch_synth_test(self):
         src    = self.input_path.get().strip()
@@ -3448,6 +3458,12 @@ class StreakerDetectApp:
         if n_frames == 0:
             return
 
+        # Release any previously open MKV cap before loading a new event
+        if getattr(self, '_player_mkv_cap', None) is not None:
+            self._player_mkv_cap.release()
+            self._player_mkv_cap = None
+        self._player_cap_pos = -1
+
         self._player_stop_loop()
         self._player_frames      = list(range(n_frames)) if use_mkv else frame_paths
         self._player_frame_cache = [None] * n_frames
@@ -3459,25 +3475,9 @@ class StreakerDetectApp:
         self._player_composite   = None
 
         if use_mkv:
-            def _preload_mkv(path, target_dir):
-                cap = cv2.VideoCapture(path)
-                cw = self.preview_canvas.winfo_width()  or 640
-                ch = self.preview_canvas.winfo_height() or 480
-                i = 0
-                while i < len(self._player_frame_cache):
-                    if self._player_event_dir != target_dir:
-                        break
-                    ret, frame = cap.read()
-                    if not ret:
-                        break
-                    h, w = frame.shape[:2]
-                    scale = min(cw / w, ch / h)
-                    nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
-                    resized = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
-                    self._player_frame_cache[i] = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-                    i += 1
-                cap.release()
-            threading.Thread(target=_preload_mkv, args=(clip_path, event_dir), daemon=True).start()
+            # Open cap for on-demand frame reads (no eager preload)
+            self._player_mkv_cap = cv2.VideoCapture(clip_path)
+            self._player_cap_pos = 0
         else:
             def _preload_frames(paths, target_dir):
                 cw = self.preview_canvas.winfo_width()  or 640
@@ -3584,7 +3584,33 @@ class StreakerDetectApp:
                 resized = cv2.resize(img_bgr, (nw, nh), interpolation=cv2.INTER_AREA)
                 rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
             else:
-                return  # MKV cache not yet loaded for this frame
+                # Load MKV frame on demand via persistent cap
+                cap = getattr(self, '_player_mkv_cap', None)
+                if cap is None:
+                    return
+                idx = self._player_idx
+                cap_pos = getattr(self, '_player_cap_pos', -1)
+                if cap_pos != idx:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                ret, frame_bgr = cap.read()
+                self._player_cap_pos = idx + 1
+                if not ret:
+                    return
+                cw = self.preview_canvas.winfo_width() or 640
+                ch = self.preview_canvas.winfo_height() or 480
+                h, w = frame_bgr.shape[:2]
+                scale = min(cw / w, ch / h)
+                nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
+                resized = cv2.resize(frame_bgr, (nw, nh), interpolation=cv2.INTER_AREA)
+                rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+                self._player_frame_cache[idx] = rgb
+                # Evict frames far from current position to keep memory bounded
+                _MAX_CACHE = 20
+                if sum(1 for x in self._player_frame_cache if x is not None) > _MAX_CACHE:
+                    for _i in range(len(self._player_frame_cache)):
+                        if self._player_frame_cache[_i] is not None and abs(_i - idx) > _MAX_CACHE // 2:
+                            self._player_frame_cache[_i] = None
+                            break
         else:
             return
         img = ImageTk.PhotoImage(Image.fromarray(rgb))
