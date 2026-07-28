@@ -54,10 +54,20 @@ TLE_URL   = (
 
 def load_config() -> dict:
     if not CONFIG_FILE.exists():
-        sys.exit(
-            f"Config file not found: {CONFIG_FILE}\n"
-            'Create it with: {"username": "...", "password": "...", "save_dir": "TLEz"}'
-        )
+        try:
+            import tkinter as tk
+            from tkinter import messagebox
+            tk.Tk().withdraw()
+            messagebox.showinfo(
+                "Setup required",
+                "GetTLE is not configured yet.\n\n"
+                "To set it up, open SkyEye and click 'Schedule TLEs' — "
+                "it will create the config and schedule automatic nightly downloads.\n\n"
+                f"(Config expected at: {CONFIG_FILE})"
+            )
+        except Exception:
+            pass
+        sys.exit(1)
     with open(CONFIG_FILE) as f:
         return json.load(f)
 
