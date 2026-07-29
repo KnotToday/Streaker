@@ -281,13 +281,6 @@ class SkyEye:
         tk.Button(parent, text="⬇  Download Now", command=self._tle_download_now,
                   **BTN_H, padx=10, pady=6, anchor='w').pack(fill='x', padx=10, pady=(0, 0))
 
-        sep()
-
-        # Preview toggle
-        self._prev_btn = tk.Button(parent, text="▶  Live Preview",
-                                   command=self._toggle_preview,
-                                   **BTN_H, padx=10, pady=8, anchor='w')
-        self._prev_btn.pack(fill='x', padx=10, pady=(4, 0))
 
     def _dot_label(self, parent):
         lbl = tk.Label(parent, text="● Idle", bg=BG2, fg=FG2,
@@ -313,16 +306,11 @@ class SkyEye:
         name = self._camera_var.get()
         cam  = next((c for c in self._cameras if c['name'] == name), None)
         if not cam:
-            messagebox.showwarning("No Camera",
-                "Select a camera profile from the dropdown before starting preview.")
             return
         url = cam.get('rtsp_url', '')
         if not url or 'user:password' in url:
-            messagebox.showwarning("No RTSP URL",
-                f"Camera '{name}' has no valid RTSP URL. Edit the profile to add one.")
             return
         self._preview_on = True
-        self._prev_btn.config(text="⏹  Stop Preview")
         self._status("Connecting to camera…")
         self._frame_q = queue.Queue(maxsize=2)
         self._cam_thread = CameraThread(url, self._frame_q)
@@ -347,12 +335,11 @@ class SkyEye:
             except Exception:
                 pass
         c.create_text(cw // 2, ch // 2,
-                      text="▶  Click 'Live Preview' to connect to camera",
+                      text="Select a camera profile to start preview",
                       fill=FG2, font=("Arial", 12), tags="placeholder")
 
     def _stop_preview(self):
         self._preview_on = False
-        self._prev_btn.config(text="▶  Live Preview")
         if self._cam_thread:
             self._cam_thread.stop()
             self._cam_thread = None
@@ -606,6 +593,7 @@ class SkyEye:
             if last and last in [c['name'] for c in self._cameras]:
                 self._camera_var.set(last)
                 self._apply_camera_profile(last)
+                self.root.after(300, self._start_preview)
         except Exception:
             pass
 
@@ -632,6 +620,8 @@ class SkyEye:
         self._apply_camera_profile(name)
         self._save_cameras()
         self._status(f"Camera profile: {name}")
+        self._stop_preview()
+        self._start_preview()
 
     def _camera_add(self):
         self._camera_dialog("Add Camera")
