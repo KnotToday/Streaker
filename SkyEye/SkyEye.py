@@ -174,6 +174,7 @@ class SkyEye:
         self._load_cameras()
         self._update_status_indicators()
         self.root.after(100, self._poll_camera)
+        threading.Thread(target=self._cleanup_stale_ffmpeg, daemon=True).start()
         self.root.after(200, lambda: self._status(
             f"Config: {_CONFIG_PATH}  ({'found' if _CONFIG_PATH.exists() else 'NOT FOUND'})"))
 
@@ -490,14 +491,14 @@ class SkyEye:
                 "schtasks", "/create", "/tn", TASK_NAME,
                 "/tr", exe,
                 "/sc", "daily",
-                "/st", "20:00",
+                "/st", "20:10",
                 "/ru", username,   # run in logged-on user session, not Session 0
                 "/f",              # overwrite if exists
             ], check=True, capture_output=True, creationflags=NO_WINDOW)
             self._update_tle_dot()
-            self._status("TLE download scheduled daily at 20:00.")
+            self._status("TLE download scheduled daily at 20:10.")
             messagebox.showinfo("Scheduled",
-                "TLE download scheduled: daily at 20:00.\n"
+                "TLE download scheduled: daily at 20:10.\n"
                 "GetTLE.exe will run automatically even when SkyEye is closed.")
         except subprocess.CalledProcessError as e:
             messagebox.showerror("Schedule Failed", e.stderr.decode(errors='replace'))
@@ -724,6 +725,28 @@ class SkyEye:
 
     # ------------------------------------------------------------------
     # Helpers
+    def _cleanup_stale_ffmpeg(self):
+        try:
+            import psutil
+            today = time.strftime("%Y-%m-%d")
+            killed = 0
+            for p in psutil.process_iter(['pid', 'name', 'create_time']):
+                try:
+                    if 'ffmpeg' not in p.info['name'].lower():
+                        continue
+                    started = time.strftime("%Y-%m-%d",
+                                           time.localtime(p.info['create_time']))
+                    if started < today:
+                        p.kill()
+                        killed += 1
+                except Exception:
+                    pass
+            if killed:
+                self.root.after(0, lambda: self._status(
+                    f"Cleaned up {killed} stale ffmpeg process(es) from previous sessions."))
+        except ImportError:
+            pass  # psutil not available
+
     # ------------------------------------------------------------------
     def _status(self, msg, error=False):
         self._status_var.set(msg)

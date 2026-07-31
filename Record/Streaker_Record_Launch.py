@@ -82,6 +82,39 @@ sys.excepthook = _excepthook
 # is gone (e.g. Python exits via an exception rather than the window close).
 _active_ffmpeg = [None]
 
+# PID file — written when ffmpeg starts, deleted when it exits cleanly.
+# On startup we kill any PID left over from a previous crashed session.
+if getattr(sys, 'frozen', False):
+    _BASE_DIR = os.path.dirname(sys.executable)
+else:
+    _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_PID_FILE = os.path.join(_BASE_DIR, f"ffmpeg_pid{_cam_suffix}.txt")
+
+
+def _cleanup_stale_ffmpeg():
+    if not os.path.exists(_PID_FILE):
+        return
+    try:
+        with open(_PID_FILE) as f:
+            pid = int(f.read().strip())
+        import psutil
+        try:
+            p = psutil.Process(pid)
+            if 'ffmpeg' in p.name().lower():
+                print(f"[INFO] Killing stale ffmpeg PID {pid} from previous session.")
+                p.kill()
+        except Exception:
+            pass
+    except Exception:
+        pass
+    try:
+        os.remove(_PID_FILE)
+    except Exception:
+        pass
+
+
+_cleanup_stale_ffmpeg()
+
 
 @atexit.register
 def _kill_ffmpeg_on_exit():
@@ -94,6 +127,10 @@ def _kill_ffmpeg_on_exit():
         except Exception:
             proc.kill()
             proc.wait()
+    try:
+        os.remove(_PID_FILE)
+    except Exception:
+        pass
     log_file.flush()
 
 # Timestamped print
@@ -279,6 +316,11 @@ class StreamCapture:
                     stderr=log_file,
                 )
                 _active_ffmpeg[0] = self.recording_process
+                try:
+                    with open(_PID_FILE, 'w') as _pf:
+                        _pf.write(str(self.recording_process.pid))
+                except Exception:
+                    pass
                 # Poll so end_dt and stop_event are checked even if ffmpeg hangs
                 while self.recording_process.poll() is None:
                     if self.stop_event.is_set() or datetime.now(timezone.utc) >= end_dt:
@@ -288,6 +330,10 @@ class StreamCapture:
                         break
                     time.sleep(1)
                 _active_ffmpeg[0] = None
+                try:
+                    os.remove(_PID_FILE)
+                except Exception:
+                    pass
                 rc = self.recording_process.returncode
                 print(f"[DEBUG] ffmpeg chunk finished, rc={rc}")
                 if rc not in (0, 1):
