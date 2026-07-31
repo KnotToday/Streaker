@@ -303,7 +303,7 @@ class StreamCapture:
 
                 cmd = [
                     FFMPEG_PATH, "-hide_banner", "-rtsp_transport", "tcp", "-rtbufsize", "400M",
-                    "-timeout", "10000000", "-stimeout", "10000000",
+                    "-timeout", "10000000",
                     "-i", self.rtsp_url.get(), "-map", "0:v:0", "-use_wallclock_as_timestamps", "1",
                     "-fflags", "+genpts", "-err_detect", "ignore_err", "-c", "copy",
                     "-avoid_negative_ts", "make_zero", "-t", str(chunk_seconds), filepath
